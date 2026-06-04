@@ -559,6 +559,7 @@ final class ServerProcess
         ];
         $env = [
             'PHP_CLI_SERVER_WORKERS' => (string) $this->config->workers,
+            'RELAY_FUZZ_CLIENT' => $this->config->client,
             'RELAY_FUZZ_REDIS_HOST' => $this->config->redisHost,
             'RELAY_FUZZ_REDIS_PORT' => (string) $this->config->redisPort,
             'RELAY_FUZZ_REDIS_DB' => (string) $this->config->redisDb,
@@ -584,6 +585,7 @@ final class ServerProcess
             'workers' => $this->config->workers,
             'rr' => $this->config->rr,
             'rr_trace_dir' => $this->rrTraceDir,
+            'client' => $this->config->client,
         ]);
         $this->logger->debug('server command line', ['command' => $this->process->getCommandLine()]);
         $this->process->start();
@@ -724,6 +726,7 @@ final class Fuzzer
             'seed' => $this->config->seed,
             'run_id' => $this->runId,
             'server' => "http://{$this->config->host}:{$this->config->port}",
+            'client' => $this->config->client,
             'workers' => $this->config->workers,
         ]);
 
@@ -1264,6 +1267,7 @@ final class Fuzzer
             'context' => $context,
             'seed' => $this->config->seed,
             'php' => $this->config->php,
+            'client' => $this->config->client,
             'run_id' => $this->runId,
             'server' => [
                 'host' => $this->config->host,
@@ -1400,6 +1404,7 @@ final class SequentialFuzzer
             'seed' => $this->config->seed,
             'run_id' => $this->runId,
             'server' => "http://{$this->config->host}:{$this->config->port}",
+            'client' => $this->config->client,
             'workers' => $this->config->workers,
             'delay_us' => $this->config->delayUs,
             'rr' => $this->config->rr,
@@ -2012,6 +2017,7 @@ final class SequentialFuzzer
             'timestamp' => date(DATE_ATOM),
             'argv' => array_values(array_map('strval', $_SERVER['argv'] ?? [])),
             'php' => $this->config->php,
+            'client' => $this->config->client,
             'command_line' => $commandLine,
             'relay_ini' => [
                 'relay.max_endpoint_dbs' => $this->config->relayMaxEndpointDbs,

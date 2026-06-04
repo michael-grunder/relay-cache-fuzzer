@@ -12,6 +12,7 @@ final class Config
     private function __construct(
         public readonly string $mode,
         public readonly string $php,
+        public readonly string $client,
         public readonly string $host,
         public readonly int $port,
         public readonly string $redisHost,
@@ -55,6 +56,7 @@ final class Config
         return new self(
             mode: self::mode(self::string($raw, 'mode', 'normal')),
             php: self::string($raw, 'php', PHP_BINARY),
+            client: self::client(self::string($raw, 'client', 'relay')),
             host: self::string($raw, 'host', '127.0.0.1'),
             port: self::int($raw, 'port', 0),
             redisHost: self::string($raw, 'redis-host', '127.0.0.1'),
@@ -91,6 +93,7 @@ final class Config
         return new self(
             mode: $this->mode,
             php: $this->php,
+            client: $this->client,
             host: $this->host,
             port: $port,
             redisHost: $this->redisHost,
@@ -165,7 +168,7 @@ final class Config
     {
         echo "Usage: bin/relay-cache-fuzzer --php=/path/to/php [options]\n";
         echo "\n";
-        echo "Options include --mode=normal|sequential, --host, --port, --redis-host, --redis-port, --redis-db,\n";
+        echo "Options include --mode=normal|sequential, --client=relay|redis, --host, --port, --redis-host, --redis-port, --redis-db,\n";
         echo "--workers, --duration, --seed, --relay-max-endpoint-dbs,\n";
         echo "--relay-max-db-writers, --kill-rate, --max-kill, --keys-per-worker,\n";
         echo "--warmup-reads, --verify-retries, --verify-delay-us, --delay-us,\n";
@@ -256,6 +259,17 @@ final class Config
         }
 
         return $mode;
+    }
+
+    private static function client(string $client): string
+    {
+        $client = strtolower($client);
+
+        if (!in_array($client, ['relay', 'redis'], true)) {
+            throw new FuzzerException('--client must be one of relay, redis');
+        }
+
+        return $client;
     }
 
     /**

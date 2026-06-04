@@ -99,10 +99,10 @@ Each observed worker PID receives string keys in this format:
 relay-fuzz:{run_id}:{pid}:{slot}
 ```
 
-The driver warms keys through Relay, increments selected keys directly in
-Redis, kills workers with a configurable signal mix, rediscovers workers, and
-then verifies that repeated `/get` requests eventually return the latest Redis
-generation.
+The driver warms keys through the configured server-side client, increments
+selected keys directly in Redis, kills workers with a configurable signal mix,
+rediscovers workers, and then verifies that repeated `/get` requests eventually
+return the latest Redis generation.
 
 ## Options
 
@@ -110,6 +110,7 @@ Common options:
 
 - `--mode=normal|sequential`: choose randomized fuzzing or the deterministic worker shutdown sequence.
 - `--php=/path/to/php`: PHP binary used for the CLI server.
+- `--client=relay|redis`: Redis client used by the CLI server. `relay` tests `Relay\Relay`; `redis` uses PhpRedis as a sanity check for the fuzzing mechanism.
 - `--host=127.0.0.1`: CLI server bind host.
 - `--port=0`: CLI server port. `0` chooses a free port.
 - `--redis-host=127.0.0.1`
