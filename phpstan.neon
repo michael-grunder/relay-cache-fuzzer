@@ -1,0 +1,9 @@
+parameters:
+  level: 6
+  paths:
+    - src
+    - bin
+
+# Optionally pin analysis assumptions:
+# phpVersion: 80400   # PHP 8.4
+# phpVersion: 80500   # PHP 8.5
