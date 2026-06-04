@@ -58,6 +58,21 @@ bin/relay-cache-fuzzer \
   --max-kill=3
 ```
 
+Run the deterministic shutdown sequence:
+
+```bash
+bin/relay-cache-fuzzer \
+  --mode=sequential \
+  --php=/home/mike/dev/phpfarm/src/php-8.5.0-debug/sapi/cli/php \
+  --workers=4 \
+  --keys-per-worker=4 \
+  --delay-us=50000 \
+  --verify-retries=8 \
+  --verify-delay-us=50000 \
+  --relay-max-endpoint-dbs=1 \
+  --relay-max-db-writers=1
+```
+
 If `--seed` is omitted, the fuzzer generates one and prints it. Pass the seed
 back in to reproduce the same randomized decisions as closely as process
 scheduling allows.
@@ -93,6 +108,7 @@ generation.
 
 Common options:
 
+- `--mode=normal|sequential`: choose randomized fuzzing or the deterministic worker shutdown sequence.
 - `--php=/path/to/php`: PHP binary used for the CLI server.
 - `--host=127.0.0.1`: CLI server bind host.
 - `--port=0`: CLI server port. `0` chooses a free port.
@@ -110,11 +126,14 @@ Common options:
 - `--warmup-reads=N`
 - `--verify-retries=N`
 - `--verify-delay-us=N`
+- `--delay-us=N`: delay between sequential-mode operations. Defaults to a small nonzero delay.
 - `--request-timeout-ms=N`
 - `--watchdog-timeout-ms=N`
 - `--signal-mix=TERM:60,INT:20,KILL:20`
 - `--log-level=info`: one of `debug`, `info`, `notice`, `warning`, `error`, `critical`, `alert`, `emergency`. `--verbose` is equivalent to `--log-level=debug` unless an explicit level is passed.
 - `--log-file=PATH`: write human diagnostics to a file instead of stderr.
+- `--rr`: run the PHP CLI server under `rr record` in sequential mode.
+- `--rr-trace-dir=PATH`: use `PATH` as the rr trace root. The fuzzer creates a unique run directory below it.
 - `--verbose`
 - `--keep-temp`
 - `--fail-fast`
@@ -149,6 +168,17 @@ specified. TTY logs use concise microtime prefixes and rich styling for humans;
 file logs stay plain text. Use `--log-level=debug` to see individual cache
 warmups, verification reads, Redis mutations, worker signal attempts, retries,
 and server output.
+
+Sequential-mode failures write a reproducer directory named like:
+
+```text
+relay-cache-fuzzer-sequential-failure-{run_id}-{timestamp}/
+```
+
+The bundle contains `startup.json`, `reproducer.json`, `events.log`,
+`server.stdout`, `server.stderr`, and, when `--rr` was enabled and rr finalized
+the trace, an `rr/` copy. The fuzzer waits for rr `incomplete` markers to
+disappear before copying a trace into the bundle.
 
 Replay an event stream with:
 

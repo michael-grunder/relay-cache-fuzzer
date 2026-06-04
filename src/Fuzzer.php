@@ -12,6 +12,8 @@ use Monolog\Logger as MonologLogger;
 use Psr\Log\LoggerInterface;
 use Random\Engine\Mt19937;
 use Random\Randomizer;
+use RecursiveDirectoryIterator;
+use RecursiveIteratorIterator;
 use RuntimeException;
 use Symfony\Component\Process\Process;
 use Throwable;
@@ -538,6 +540,7 @@ final class ServerProcess
     public function __construct(
         private readonly Config $config,
         private readonly LoggerInterface $logger,
+        private readonly ?string $rrTraceDir = null,
     ) {
         $this->stdout = new RingBuffer(200);
         $this->stderr = new RingBuffer(200);
@@ -554,22 +557,33 @@ final class ServerProcess
             '-S', $this->config->host . ':' . $this->config->port,
             $router,
         ];
+        $env = [
+            'PHP_CLI_SERVER_WORKERS' => (string) $this->config->workers,
+            'RELAY_FUZZ_REDIS_HOST' => $this->config->redisHost,
+            'RELAY_FUZZ_REDIS_PORT' => (string) $this->config->redisPort,
+            'RELAY_FUZZ_REDIS_DB' => (string) $this->config->redisDb,
+        ];
+
+        if ($this->config->rr) {
+            $command = array_merge(['rr', 'record'], $command);
+
+            if ($this->rrTraceDir !== null) {
+                $env['_RR_TRACE_DIR'] = $this->rrTraceDir;
+            }
+        }
 
         $this->process = new Process(
             $command,
             dirname(__DIR__),
-            [
-                'PHP_CLI_SERVER_WORKERS' => (string) $this->config->workers,
-                'RELAY_FUZZ_REDIS_HOST' => $this->config->redisHost,
-                'RELAY_FUZZ_REDIS_PORT' => (string) $this->config->redisPort,
-                'RELAY_FUZZ_REDIS_DB' => (string) $this->config->redisDb,
-            ],
+            $env,
         );
         $this->process->setTimeout(null);
         $this->logger->info('starting PHP CLI server', [
             'host' => $this->config->host,
             'port' => $this->config->port,
             'workers' => $this->config->workers,
+            'rr' => $this->config->rr,
+            'rr_trace_dir' => $this->rrTraceDir,
         ]);
         $this->logger->debug('server command line', ['command' => $this->process->getCommandLine()]);
         $this->process->start();
@@ -619,6 +633,19 @@ final class ServerProcess
             $this->logger->info('stopping PHP CLI server', ['parent_pid' => $this->process->getPid()]);
             $this->process->stop(1.0, 15);
         }
+    }
+
+    /**
+     * @return array{stdout: string, stderr: string}
+     */
+    public function outputText(): array
+    {
+        $tails = $this->tails();
+
+        return [
+            'stdout' => implode("\n", array_map('strval', $tails['stdout'])) . ($tails['stdout'] === [] ? '' : "\n"),
+            'stderr' => implode("\n", array_map('strval', $tails['stderr'])) . ($tails['stderr'] === [] ? '' : "\n"),
+        ];
     }
 
     private function pushLines(RingBuffer $buffer, string $chunk, string $stream = 'server'): void
@@ -1271,6 +1298,871 @@ final class Fuzzer
         $this->logger->error('wrote failure reproducer', ['path' => $path, 'reason' => $reason]);
 
         return $path;
+    }
+
+    private static function pickFreePort(string $host): int
+    {
+        $errno = 0;
+        $errstr = '';
+        $socket = @stream_socket_server("tcp://{$host}:0", $errno, $errstr);
+
+        if ($socket === false) {
+            throw new FuzzerException("Could not pick a free port on {$host}: {$errstr}");
+        }
+
+        $name = stream_socket_get_name($socket, false);
+        fclose($socket);
+
+        if (!is_string($name) || !preg_match('/:(\d+)$/', $name, $matches)) {
+            throw new FuzzerException('Could not parse free port');
+        }
+
+        return (int) $matches[1];
+    }
+
+    private static function signalName(int $signal): string
+    {
+        return match ($signal) {
+            2 => 'SIGINT',
+            9 => 'SIGKILL',
+            15 => 'SIGTERM',
+            default => 'SIG' . $signal,
+        };
+    }
+}
+
+final class SequentialFuzzer
+{
+    private Config $config;
+    private Rng $rng;
+    private RedisClient $redis;
+    private HttpClient $http;
+    private ServerProcess $server;
+    private LoggerInterface $logger;
+    private string $runId;
+    private ?string $rrTraceDir;
+
+    /** @var array<int, true> */
+    private array $workers = [];
+
+    /** @var array<int, true> */
+    private array $aliveWorkers = [];
+
+    /** @var array<int, true> */
+    private array $killedPids = [];
+
+    /** @var array<int, list<string>> */
+    private array $keysByPid = [];
+
+    /** @var array<string, int> */
+    private array $expected = [];
+
+    /** @var array<string, int> */
+    private array $keyOwner = [];
+
+    /** @var list<array<string, mixed>> */
+    private array $events = [];
+
+    /** @var list<string> */
+    private array $eventLines = [];
+
+    /** @var list<array<string, mixed>> */
+    private array $mutations = [];
+
+    /** @var list<array<string, mixed>> */
+    private array $staleObservations = [];
+
+    /** @var array<string, mixed>|null */
+    private ?array $failureContext = null;
+
+    /** @var array<string, int> */
+    private array $stats = [
+        'requests' => 0,
+        'failed_requests' => 0,
+        'workers_discovered' => 0,
+        'workers_killed' => 0,
+        'stale_observations' => 0,
+        'persistent_stale_failures' => 0,
+    ];
+
+    public function __construct(Config $config)
+    {
+        $this->config = $config->port === 0 ? $config->withPort(self::pickFreePort($config->host)) : $config;
+        $this->logger = LogFactory::create($this->config);
+        $this->rng = new Rng($this->config->seed);
+        $this->runId = dechex($this->config->seed) . '-seq-' . bin2hex(random_bytes(3));
+        $this->rrTraceDir = $this->prepareRrTraceDir();
+    }
+
+    public function run(): void
+    {
+        $this->logger->info('starting sequential fuzz run', [
+            'seed' => $this->config->seed,
+            'run_id' => $this->runId,
+            'server' => "http://{$this->config->host}:{$this->config->port}",
+            'workers' => $this->config->workers,
+            'delay_us' => $this->config->delayUs,
+            'rr' => $this->config->rr,
+            'rr_trace_dir' => $this->rrTraceDir,
+        ]);
+
+        $this->redis = new RedisClient(
+            $this->config->redisHost,
+            $this->config->redisPort,
+            $this->config->redisDb,
+            $this->config->requestTimeoutMs,
+        );
+        $this->redis->ping();
+
+        $this->http = new HttpClient($this->config->host, $this->config->port, $this->config->requestTimeoutMs);
+        $this->server = new ServerProcess($this->config, $this->logger, $this->rrTraceDir);
+
+        try {
+            $this->server->start();
+            $this->waitUntilReady();
+            $this->discoverInitialWorkers();
+            $this->warmAllWorkers();
+            $this->shutdownLoop();
+            $this->finalWorkerPhase();
+            $this->cleanupRedisKeys();
+            $this->cleanupTempTrace();
+
+            $this->logger->info('completed sequential fuzz run', [
+                'workers_killed' => $this->stats['workers_killed'],
+                'stale_observations' => $this->stats['stale_observations'],
+            ]);
+        } catch (Throwable $e) {
+            $this->server->stop();
+
+            $path = $this->writeBundle($e->getMessage(), $this->failureContext ?? [], $e);
+            $this->logger->error('sequential fuzz run failed', ['error' => $e->getMessage(), 'reproducer' => $path]);
+
+            throw new FuzzerException($e->getMessage() . "\nreproducer={$path}", previous: $e);
+        } finally {
+            $this->server->stop();
+        }
+    }
+
+    private function waitUntilReady(): void
+    {
+        $deadline = microtime(true) + 10.0;
+
+        while (microtime(true) < $deadline) {
+            if (!$this->server->isRunning()) {
+                $this->fail('PHP CLI server parent exited before becoming ready');
+            }
+
+            if ($this->tryRequest('/pid') !== null) {
+                $this->logger->info('PHP CLI server is ready');
+                return;
+            }
+
+            usleep(50_000);
+        }
+
+        $this->fail('PHP CLI server did not become ready');
+    }
+
+    private function discoverInitialWorkers(): void
+    {
+        $deadline = microtime(true) + 15.0;
+        $attempt = 0;
+
+        while (microtime(true) < $deadline && count($this->workers) < $this->config->workers) {
+            $attempt++;
+            $response = $this->tryRequest('/pid');
+
+            if ($response === null) {
+                usleep(20_000);
+                continue;
+            }
+
+            $this->observePid($this->responsePid($response));
+
+            if ($attempt % max(1, $this->config->workers * 10) === 0) {
+                usleep(20_000);
+            }
+        }
+
+        if (count($this->workers) < $this->config->workers) {
+            $this->fail('Could not discover all configured workers', [
+                'expected' => $this->config->workers,
+                'observed' => array_keys($this->workers),
+            ]);
+        }
+
+        $this->aliveWorkers = $this->workers;
+    }
+
+    private function observePid(int $pid): void
+    {
+        $parentPid = $this->server->parentPid();
+
+        if ($parentPid !== null && $pid === $parentPid) {
+            return;
+        }
+
+        if (isset($this->workers[$pid])) {
+            return;
+        }
+
+        $this->workers[$pid] = true;
+        $this->stats['workers_discovered']++;
+        $this->assignKeys($pid);
+        $this->recordEvent('discover', ['pid' => $pid]);
+        $this->logLine('DISCOVER', ['pid' => $pid, 'known' => count($this->workers)]);
+    }
+
+    private function assignKeys(int $pid): void
+    {
+        $keys = [];
+
+        for ($slot = 0; $slot < $this->config->keysPerWorker; $slot++) {
+            $key = "relay-fuzz:{$this->runId}:{$pid}:{$slot}";
+            $this->redis->set($key, '0');
+            $this->expected[$key] = 0;
+            $this->keyOwner[$key] = $pid;
+            $keys[] = $key;
+            $this->recordEvent('set', ['pid' => $pid, 'key' => $key, 'value' => '0']);
+        }
+
+        $this->keysByPid[$pid] = $keys;
+    }
+
+    private function warmAllWorkers(): void
+    {
+        foreach (array_keys($this->workers) as $pid) {
+            foreach ($this->keysByPid[$pid] as $key) {
+                $this->warmKeyOnWorker($pid, $key);
+                $this->sequentialDelay('warm');
+            }
+        }
+
+        $this->logLine('OK', ['phase' => 'warmup', 'workers' => count($this->workers)]);
+    }
+
+    private function warmKeyOnWorker(int $targetPid, string $key): void
+    {
+        $attempts = 0;
+        $deadline = microtime(true) + max(5.0, $this->config->watchdogTimeoutMs / 1000);
+
+        while (microtime(true) < $deadline) {
+            $attempts++;
+            $response = $this->tryRequest('/warm?key=' . rawurlencode($key) . '&n=' . $this->config->warmupReads);
+
+            if ($response === null) {
+                usleep(10_000);
+                continue;
+            }
+
+            $pid = $this->responsePid($response);
+            $this->observePid($pid);
+            $tracked = $response['tracked'] ?? null;
+            $value = $response['value'] === null ? null : (string) $response['value'];
+            $this->recordEvent('warm', [
+                'pid' => $pid,
+                'target_pid' => $targetPid,
+                'key' => $key,
+                'tracked' => $tracked,
+                'value' => $value,
+                'reads' => $this->config->warmupReads,
+                'attempt' => $attempts,
+            ]);
+
+            if ($pid === $targetPid) {
+                $this->logLine('WARM', [
+                    'pid' => $pid,
+                    'key' => $key,
+                    'tracked' => $tracked === true ? 'yes' : 'no',
+                ]);
+                return;
+            }
+
+            usleep(10_000);
+        }
+
+        $this->fail('Could not route warmup request to target worker', [
+            'pid' => $targetPid,
+            'key' => $key,
+            'attempts' => $attempts,
+        ]);
+    }
+
+    private function shutdownLoop(): void
+    {
+        while (count($this->aliveWorkers) > 1) {
+            $pid = $this->pickAliveWorker();
+            $signal = $this->rng->weighted($this->config->signalWeights);
+            $signalName = self::signalName($signal);
+
+            $this->logLine('KILL', ['pid' => $pid, 'signal' => $signalName]);
+            $this->killPid($pid, $signal);
+            $this->waitForWorkerDeath($pid, $signal !== 9);
+            unset($this->aliveWorkers[$pid]);
+            $this->sequentialDelay('worker death');
+
+            $keys = $this->keysByPid[$pid] ?? [];
+            $this->mutateKeys($keys);
+            $this->sequentialDelay('mutation');
+            $this->verifyKeys($keys, $this->aliveWorkers);
+            $this->sequentialDelay('verification');
+
+            $this->logLine('OK', ['pid' => $pid, 'remaining_workers' => count($this->aliveWorkers)]);
+        }
+    }
+
+    private function finalWorkerPhase(): void
+    {
+        $alive = array_keys($this->aliveWorkers);
+        $pid = $alive[0] ?? null;
+
+        if ($pid === null) {
+            $this->fail('No final worker remained for final phase');
+        }
+
+        $keys = array_keys($this->expected);
+        $this->logLine('FINAL', ['pid' => $pid, 'keys' => count($keys)]);
+        $this->mutateKeys($keys);
+        $this->sequentialDelay('final mutation');
+        $this->verifyKeys($keys, $this->aliveWorkers);
+        $this->recordFinalCacheState($keys);
+
+        $signal = $this->rng->weighted($this->config->signalWeights);
+        $signalName = self::signalName($signal);
+        $this->logLine('KILL', ['pid' => $pid, 'signal' => $signalName, 'final' => true]);
+        $this->killPid($pid, $signal);
+        $this->waitForWorkerDeath($pid, $signal !== 9);
+        unset($this->aliveWorkers[$pid]);
+        $this->logLine('OK', ['phase' => 'final-worker']);
+    }
+
+    private function pickAliveWorker(): int
+    {
+        $pids = array_keys($this->aliveWorkers);
+        sort($pids);
+
+        return $this->rng->pick($pids);
+    }
+
+    private function killPid(int $pid, int $signal): void
+    {
+        if (!function_exists('posix_kill')) {
+            $this->fail('posix_kill is required for sequential mode');
+        }
+
+        $ok = @posix_kill($pid, $signal);
+        $signalName = self::signalName($signal);
+        $this->recordEvent('kill', [
+            'pid' => $pid,
+            'signal' => $signalName,
+            'ok' => $ok,
+        ]);
+        $alreadyKilled = isset($this->killedPids[$pid]);
+        $this->killedPids[$pid] = true;
+
+        if (!$ok) {
+            $this->fail('Failed to signal worker', ['pid' => $pid, 'signal' => $signalName]);
+        }
+
+        if (!$alreadyKilled) {
+            $this->stats['workers_killed']++;
+        }
+    }
+
+    private function waitForWorkerDeath(int $pid, bool $allowEscalation): void
+    {
+        if ($this->waitForWorkerExit($pid)) {
+            return;
+        }
+
+        if ($allowEscalation) {
+            $this->logLine('KILL', ['pid' => $pid, 'signal' => 'SIGKILL', 'escalated' => true], 'warning');
+            $this->killPid($pid, 9);
+
+            if ($this->waitForWorkerExit($pid)) {
+                return;
+            }
+        }
+
+        $this->fail('Worker death was not observed before timeout', ['pid' => $pid]);
+    }
+
+    private function waitForWorkerExit(int $pid): bool
+    {
+        $deadline = microtime(true) + max(1.0, $this->config->watchdogTimeoutMs / 1000);
+
+        while (microtime(true) < $deadline) {
+            if (!$this->processExists($pid)) {
+                $this->recordEvent('death_observed', ['pid' => $pid]);
+                $this->logLine('DEAD', ['pid' => $pid]);
+                return true;
+            }
+
+            $response = $this->tryRequest('/pid');
+
+            if ($response !== null && $this->responsePid($response) === $pid) {
+                usleep(20_000);
+                continue;
+            }
+
+            usleep(20_000);
+        }
+
+        return false;
+    }
+
+    /**
+     * @param list<string> $keys
+     */
+    private function mutateKeys(array $keys): void
+    {
+        foreach ($keys as $key) {
+            $value = $this->redis->incr($key);
+            $this->expected[$key] = $value;
+            $event = [
+                'key' => $key,
+                'expected' => $value,
+                'owner_pid' => $this->keyOwner[$key] ?? null,
+            ];
+            $this->mutations[] = $event;
+            $this->recordEvent('incr', $event);
+            $this->logLine('INVALIDATE', $event);
+        }
+    }
+
+    /**
+     * @param list<string> $keys
+     * @param array<int, true> $survivors
+     */
+    private function verifyKeys(array $keys, array $survivors): void
+    {
+        foreach ($keys as $key) {
+            $this->verifyKey($key, $survivors);
+        }
+    }
+
+    /**
+     * @param array<int, true> $survivors
+     */
+    private function verifyKey(string $key, array $survivors): void
+    {
+        $expected = (string) $this->expected[$key];
+        $survivorCount = max(1, count($survivors));
+        $maxAttempts = max($this->config->verifyRetries, $this->config->verifyRetries * $survivorCount);
+        $lastMismatch = null;
+        $seen = [];
+
+        for ($attempt = 1; $attempt <= $maxAttempts; $attempt++) {
+            $response = $this->tryRequest('/get?key=' . rawurlencode($key));
+
+            if ($response === null) {
+                $lastMismatch = ['type' => 'request_failed', 'attempt' => $attempt];
+                $this->verifyDelay();
+                continue;
+            }
+
+            $pid = $this->responsePid($response);
+            $value = $response['value'] === null ? null : (string) $response['value'];
+            $tracked = $response['tracked'] ?? null;
+            $event = [
+                'pid' => $pid,
+                'key' => $key,
+                'value' => $value,
+                'expected' => $expected,
+                'tracked' => $tracked,
+                'attempt' => $attempt,
+            ];
+            $this->recordEvent('get', $event);
+            $this->logLine('VERIFY', $event);
+
+            if (isset($this->killedPids[$pid])) {
+                $this->fail('Killed worker served a request after death was observed', $event);
+            }
+
+            if (!isset($survivors[$pid])) {
+                $this->observePid($pid);
+            }
+
+            if ($value === $expected) {
+                if (isset($survivors[$pid])) {
+                    $seen[$pid] = true;
+                }
+
+                $lastMismatch = null;
+
+                if (count($seen) >= count($survivors)) {
+                    return;
+                }
+
+                continue;
+            }
+
+            $lastMismatch = $event;
+
+            if ($value !== null && ctype_digit($value) && (int) $value < (int) $expected) {
+                $this->stats['stale_observations']++;
+                $this->staleObservations[] = $event;
+                $this->logLine('STALE', $event, 'warning');
+            }
+
+            $this->verifyDelay();
+        }
+
+        if ($lastMismatch !== null) {
+            $this->stats['persistent_stale_failures']++;
+            $redisValue = $this->redis->get($key);
+            $this->fail('Persistent stale or mismatched value in sequential mode', [
+                'key' => $key,
+                'expected' => $expected,
+                'redis_value' => $redisValue,
+                'last_mismatch' => $lastMismatch,
+                'owner_pid' => $this->keyOwner[$key] ?? null,
+                'owner_pid_killed' => isset($this->killedPids[$this->keyOwner[$key] ?? 0]),
+                'survivors' => array_keys($survivors),
+            ]);
+        }
+    }
+
+    /**
+     * @param list<string> $keys
+     */
+    private function recordFinalCacheState(array $keys): void
+    {
+        foreach ($keys as $key) {
+            $response = $this->tryRequest('/tracked?key=' . rawurlencode($key));
+
+            if ($response === null) {
+                continue;
+            }
+
+            $event = [
+                'pid' => $this->responsePid($response),
+                'key' => $key,
+                'tracked' => $response['tracked'] ?? null,
+            ];
+            $this->recordEvent('final_cache_state', $event);
+            $this->logLine('FINAL', $event);
+        }
+    }
+
+    /**
+     * @return array<string, mixed>|null
+     */
+    private function tryRequest(string $path): ?array
+    {
+        $this->stats['requests']++;
+
+        try {
+            return $this->http->getJson($path);
+        } catch (RequestException $e) {
+            $this->stats['failed_requests']++;
+            $this->logger->debug('request failed', [
+                'path' => $path,
+                'timeout' => $e->timedOut,
+                'error' => $e->getMessage(),
+            ]);
+
+            return null;
+        }
+    }
+
+    /**
+     * @param array<string, mixed> $response
+     */
+    private function responsePid(array $response): int
+    {
+        if (!isset($response['pid']) || !is_int($response['pid'])) {
+            $this->fail('Response did not include an integer pid', ['response' => $response]);
+        }
+
+        return $response['pid'];
+    }
+
+    private function sequentialDelay(string $reason): void
+    {
+        if ($this->config->delayUs <= 0) {
+            return;
+        }
+
+        $this->logger->debug('sequential delay', ['reason' => $reason, 'delay_us' => $this->config->delayUs]);
+        usleep($this->config->delayUs);
+    }
+
+    private function verifyDelay(): void
+    {
+        if ($this->config->verifyDelayUs <= 0) {
+            return;
+        }
+
+        $this->logger->debug('verification delay', ['delay_us' => $this->config->verifyDelayUs]);
+        usleep($this->config->verifyDelayUs);
+    }
+
+    private function cleanupRedisKeys(): void
+    {
+        $this->redis->del(array_keys($this->expected));
+    }
+
+    private function processExists(int $pid): bool
+    {
+        if (!function_exists('posix_kill') || !@posix_kill($pid, 0)) {
+            return false;
+        }
+
+        $stat = @file_get_contents("/proc/{$pid}/stat");
+
+        if (is_string($stat) && preg_match('/^\d+\s+\(.+\)\s+([A-Z])\s/', $stat, $matches)) {
+            return $matches[1] !== 'Z';
+        }
+
+        return true;
+    }
+
+    /**
+     * @param array<string, mixed> $context
+     */
+    private function fail(string $message, array $context = []): never
+    {
+        $this->failureContext = $context;
+        $this->recordEvent('failure', ['message' => $message, 'context' => $context]);
+        $this->logger->error('aborting sequential fuzz run', ['reason' => $message, 'context' => $context]);
+
+        throw new FuzzerException($message);
+    }
+
+    /**
+     * @param array<string, mixed> $context
+     */
+    private function recordEvent(string $type, array $context): void
+    {
+        $this->events[] = ['time' => sprintf('%.6f', microtime(true)), 'type' => $type] + $context;
+    }
+
+    /**
+     * @param array<string, mixed> $context
+     */
+    private function logLine(string $tag, array $context, string $level = 'info'): void
+    {
+        $line = '[' . $tag . ']';
+
+        foreach ($context as $key => $value) {
+            if (is_bool($value)) {
+                $value = $value ? 'true' : 'false';
+            } elseif ($value === null) {
+                $value = 'null';
+            } elseif (!is_scalar($value)) {
+                $value = json_encode($value, JSON_UNESCAPED_SLASHES | JSON_THROW_ON_ERROR);
+            }
+
+            $line .= ' ' . $key . '=' . (string) $value;
+        }
+
+        $this->eventLines[] = sprintf('[%.6f] %s', microtime(true), $line);
+
+        if ($level === 'warning') {
+            $this->logger->warning($line);
+            return;
+        }
+
+        $this->logger->info($line);
+    }
+
+    private function prepareRrTraceDir(): ?string
+    {
+        if (!$this->config->rr) {
+            return null;
+        }
+
+        $root = $this->config->rrTraceDir ?? sys_get_temp_dir();
+        $path = rtrim($root, DIRECTORY_SEPARATOR) . DIRECTORY_SEPARATOR . 'relay-cache-fuzzer-rr-' . $this->runId;
+
+        if (!is_dir($path) && !mkdir($path, 0777, true)) {
+            throw new FuzzerException("Could not create rr trace directory {$path}");
+        }
+
+        return $path;
+    }
+
+    private function cleanupTempTrace(): void
+    {
+        if (!$this->config->rr || $this->config->keepTemp || $this->config->rrTraceDir !== null || $this->rrTraceDir === null) {
+            return;
+        }
+
+        $this->removeTree($this->rrTraceDir);
+    }
+
+    /**
+     * @param array<string, mixed> $context
+     */
+    private function writeBundle(string $reason, array $context, Throwable $throwable): string
+    {
+        $this->server->drain();
+
+        $path = getcwd() . '/relay-cache-fuzzer-sequential-failure-' . $this->runId . '-' . date('Ymd-His');
+
+        if (!mkdir($path, 0777, true) && !is_dir($path)) {
+            throw new FuzzerException("Could not create reproducer bundle {$path}", previous: $throwable);
+        }
+
+        $commandLine = $this->server->commandLine();
+        $output = $this->server->outputText();
+        $startup = [
+            'seed' => $this->config->seed,
+            'timestamp' => date(DATE_ATOM),
+            'argv' => array_values(array_map('strval', $_SERVER['argv'] ?? [])),
+            'php' => $this->config->php,
+            'command_line' => $commandLine,
+            'relay_ini' => [
+                'relay.max_endpoint_dbs' => $this->config->relayMaxEndpointDbs,
+                'relay.max_db_writers' => $this->config->relayMaxDbWriters,
+                'relay.cache' => 1,
+            ],
+            'workers' => $this->config->workers,
+            'redis' => [
+                'host' => $this->config->redisHost,
+                'port' => $this->config->redisPort,
+                'db' => $this->config->redisDb,
+            ],
+            'signal_strategy' => 'random',
+            'signal_weights' => $this->config->signalWeights,
+            'delay_us' => $this->config->delayUs,
+            'verify_retries' => $this->config->verifyRetries,
+            'verify_delay_us' => $this->config->verifyDelayUs,
+            'rr' => $this->config->rr,
+            'rr_trace_dir' => $this->rrTraceDir,
+        ];
+        $reproducer = [
+            'reason' => $reason,
+            'exception' => $throwable::class,
+            'message' => $throwable->getMessage(),
+            'context' => $context,
+            'run_id' => $this->runId,
+            'stats' => $this->stats,
+            'workers' => [
+                'observed_pids' => array_map('intval', array_keys($this->workers)),
+                'alive_pids' => array_map('intval', array_keys($this->aliveWorkers)),
+                'killed_pids' => array_map('intval', array_keys($this->killedPids)),
+                'keys_by_pid' => $this->keysByPid,
+            ],
+            'expected' => $this->expected,
+            'mutations' => $this->mutations,
+            'stale_observations' => $this->staleObservations,
+            'events' => $this->events,
+        ];
+
+        file_put_contents($path . '/startup.json', json_encode($startup, JSON_PRETTY_PRINT | JSON_UNESCAPED_SLASHES | JSON_THROW_ON_ERROR) . "\n");
+        file_put_contents($path . '/reproducer.json', json_encode($reproducer, JSON_PRETTY_PRINT | JSON_UNESCAPED_SLASHES | JSON_THROW_ON_ERROR) . "\n");
+        file_put_contents($path . '/events.log', implode("\n", $this->eventLines) . ($this->eventLines === [] ? '' : "\n"));
+        file_put_contents($path . '/server.stdout', $output['stdout']);
+        file_put_contents($path . '/server.stderr', $output['stderr']);
+
+        if ($this->config->rr && $this->rrTraceDir !== null) {
+            $this->preserveRrTrace($path . '/rr');
+        }
+
+        return $path;
+    }
+
+    private function preserveRrTrace(string $destination): void
+    {
+        if ($this->rrTraceDir === null || !is_dir($this->rrTraceDir)) {
+            file_put_contents(dirname($destination) . '/rr-missing.txt', "rr trace directory was not found\n");
+            return;
+        }
+
+        if (!$this->waitForRrTraceFinalized($this->rrTraceDir)) {
+            file_put_contents(dirname($destination) . '/rr-incomplete.txt', "rr trace still had an incomplete file and was not copied\n");
+            return;
+        }
+
+        $this->copyTree($this->rrTraceDir, $destination);
+    }
+
+    private function waitForRrTraceFinalized(string $traceDir): bool
+    {
+        $deadline = microtime(true) + 15.0;
+
+        while (microtime(true) < $deadline) {
+            if (!$this->treeContainsBasename($traceDir, 'incomplete')) {
+                return true;
+            }
+
+            usleep(100_000);
+        }
+
+        return false;
+    }
+
+    private function treeContainsBasename(string $path, string $basename): bool
+    {
+        if (!is_dir($path)) {
+            return false;
+        }
+
+        $iterator = new RecursiveIteratorIterator(
+            new RecursiveDirectoryIterator($path, RecursiveDirectoryIterator::SKIP_DOTS),
+            RecursiveIteratorIterator::SELF_FIRST,
+        );
+
+        foreach ($iterator as $item) {
+            if ($item->getBasename() === $basename) {
+                return true;
+            }
+        }
+
+        return false;
+    }
+
+    private function copyTree(string $source, string $destination): void
+    {
+        if (!mkdir($destination, 0777, true) && !is_dir($destination)) {
+            throw new FuzzerException("Could not create rr bundle directory {$destination}");
+        }
+
+        $iterator = new RecursiveIteratorIterator(
+            new RecursiveDirectoryIterator($source, RecursiveDirectoryIterator::SKIP_DOTS),
+            RecursiveIteratorIterator::SELF_FIRST,
+        );
+
+        foreach ($iterator as $item) {
+            $target = $destination . DIRECTORY_SEPARATOR . $iterator->getSubPathName();
+
+            if ($item->isDir()) {
+                if (!is_dir($target) && !mkdir($target, 0777, true)) {
+                    throw new FuzzerException("Could not create directory {$target}");
+                }
+
+                continue;
+            }
+
+            if (!copy($item->getPathname(), $target)) {
+                throw new FuzzerException("Could not copy rr trace file {$item->getPathname()}");
+            }
+        }
+    }
+
+    private function removeTree(string $path): void
+    {
+        if (!is_dir($path)) {
+            return;
+        }
+
+        $iterator = new RecursiveIteratorIterator(
+            new RecursiveDirectoryIterator($path, RecursiveDirectoryIterator::SKIP_DOTS),
+            RecursiveIteratorIterator::CHILD_FIRST,
+        );
+
+        foreach ($iterator as $item) {
+            if ($item->isDir()) {
+                rmdir($item->getPathname());
+                continue;
+            }
+
+            unlink($item->getPathname());
+        }
+
+        rmdir($path);
     }
 
     private static function pickFreePort(string $host): int

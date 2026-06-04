@@ -10,6 +10,7 @@ final class Config
      * @param array<int, int> $signalWeights
      */
     private function __construct(
+        public readonly string $mode,
         public readonly string $php,
         public readonly string $host,
         public readonly int $port,
@@ -27,6 +28,7 @@ final class Config
         public readonly int $warmupReads,
         public readonly int $verifyRetries,
         public readonly int $verifyDelayUs,
+        public readonly int $delayUs,
         public readonly int $requestTimeoutMs,
         public readonly int $watchdogTimeoutMs,
         public readonly bool $verbose,
@@ -36,6 +38,8 @@ final class Config
         public readonly bool $failFast,
         public readonly array $signalWeights,
         public readonly ?string $replayFile,
+        public readonly bool $rr,
+        public readonly ?string $rrTraceDir,
     ) {
     }
 
@@ -49,6 +53,7 @@ final class Config
         $verbose = self::bool($raw, 'verbose');
 
         return new self(
+            mode: self::mode(self::string($raw, 'mode', 'normal')),
             php: self::string($raw, 'php', PHP_BINARY),
             host: self::string($raw, 'host', '127.0.0.1'),
             port: self::int($raw, 'port', 0),
@@ -66,6 +71,7 @@ final class Config
             warmupReads: max(1, self::int($raw, 'warmup-reads', 16)),
             verifyRetries: max(1, self::int($raw, 'verify-retries', 8)),
             verifyDelayUs: max(0, self::int($raw, 'verify-delay-us', 50000)),
+            delayUs: max(0, self::int($raw, 'delay-us', 50000)),
             requestTimeoutMs: max(1, self::int($raw, 'request-timeout-ms', 1000)),
             watchdogTimeoutMs: max(1, self::int($raw, 'watchdog-timeout-ms', 5000)),
             verbose: $verbose,
@@ -75,12 +81,15 @@ final class Config
             failFast: self::bool($raw, 'fail-fast'),
             signalWeights: self::parseSignalMix(self::string($raw, 'signal-mix', 'TERM:60,INT:20,KILL:20')),
             replayFile: isset($raw['replay']) ? self::string($raw, 'replay') : null,
+            rr: self::bool($raw, 'rr'),
+            rrTraceDir: isset($raw['rr-trace-dir']) ? self::string($raw, 'rr-trace-dir') : null,
         );
     }
 
     public function withPort(int $port): self
     {
         return new self(
+            mode: $this->mode,
             php: $this->php,
             host: $this->host,
             port: $port,
@@ -98,6 +107,7 @@ final class Config
             warmupReads: $this->warmupReads,
             verifyRetries: $this->verifyRetries,
             verifyDelayUs: $this->verifyDelayUs,
+            delayUs: $this->delayUs,
             requestTimeoutMs: $this->requestTimeoutMs,
             watchdogTimeoutMs: $this->watchdogTimeoutMs,
             verbose: $this->verbose,
@@ -107,6 +117,8 @@ final class Config
             failFast: $this->failFast,
             signalWeights: $this->signalWeights,
             replayFile: $this->replayFile,
+            rr: $this->rr,
+            rrTraceDir: $this->rrTraceDir,
         );
     }
 
@@ -153,12 +165,12 @@ final class Config
     {
         echo "Usage: bin/relay-cache-fuzzer --php=/path/to/php [options]\n";
         echo "\n";
-        echo "Options include --host, --port, --redis-host, --redis-port, --redis-db,\n";
+        echo "Options include --mode=normal|sequential, --host, --port, --redis-host, --redis-port, --redis-db,\n";
         echo "--workers, --duration, --seed, --relay-max-endpoint-dbs,\n";
         echo "--relay-max-db-writers, --kill-rate, --max-kill, --keys-per-worker,\n";
-        echo "--warmup-reads, --verify-retries, --verify-delay-us,\n";
+        echo "--warmup-reads, --verify-retries, --verify-delay-us, --delay-us,\n";
         echo "--request-timeout-ms, --signal-mix, --log-level, --log-file,\n";
-        echo "--replay, --verbose,\n";
+        echo "--replay, --rr, --rr-trace-dir, --verbose,\n";
         echo "--keep-temp, and --fail-fast.\n";
     }
 
@@ -233,6 +245,17 @@ final class Config
         }
 
         return $level;
+    }
+
+    private static function mode(string $mode): string
+    {
+        $mode = strtolower($mode);
+
+        if (!in_array($mode, ['normal', 'sequential'], true)) {
+            throw new FuzzerException('--mode must be one of normal, sequential');
+        }
+
+        return $mode;
     }
 
     /**

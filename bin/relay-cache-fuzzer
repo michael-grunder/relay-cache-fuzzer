@@ -6,6 +6,7 @@ declare(strict_types=1);
 use MichaelGrunder\RelayCacheFuzzer\Config;
 use MichaelGrunder\RelayCacheFuzzer\Fuzzer;
 use MichaelGrunder\RelayCacheFuzzer\ReplayRunner;
+use MichaelGrunder\RelayCacheFuzzer\SequentialFuzzer;
 
 require dirname(__DIR__) . '/vendor/autoload.php';
 require dirname(__DIR__) . '/src/Fuzzer.php';
@@ -16,6 +17,9 @@ try {
     if ($config->replayFile !== null) {
         $runner = new ReplayRunner($config);
         $runner->run();
+    } elseif ($config->mode === 'sequential') {
+        $fuzzer = new SequentialFuzzer($config);
+        $fuzzer->run();
     } else {
         $fuzzer = new Fuzzer($config);
         $fuzzer->run();
