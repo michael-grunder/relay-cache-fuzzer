@@ -12,3 +12,12 @@ PHP source tree or an installed PHP binary.
   mutations belong in the external driver.
 - Run static analysis with `vendor/bin/phpstan analyze`.
 - For quick syntax checks, use `php -l` on changed PHP files.
+
+
+### PHP build tree
+
+You may be ini a full PHP build tree. You can check by running `farmroot` and if so it will
+print the absolute path to the actual root of teh tree. Additionally you can look in
+`$(farmroot)/ext/relay/AGENTS.md` for additional info and local build utilities that can be
+usefule.
+
