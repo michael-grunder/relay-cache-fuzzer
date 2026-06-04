@@ -4,6 +4,12 @@ declare(strict_types=1);
 
 namespace MichaelGrunder\RelayCacheFuzzer;
 
+use Monolog\Formatter\FormatterInterface;
+use Monolog\Handler\StreamHandler;
+use Monolog\Level;
+use Monolog\LogRecord;
+use Monolog\Logger as MonologLogger;
+use Psr\Log\LoggerInterface;
 use Random\Engine\Mt19937;
 use Random\Randomizer;
 use RuntimeException;
@@ -19,6 +25,113 @@ final class RequestException extends RuntimeException
     public function __construct(string $message, public readonly bool $timedOut = false)
     {
         parent::__construct($message);
+    }
+}
+
+final class HumanLogFormatter implements FormatterInterface
+{
+    public function __construct(private readonly bool $decorated)
+    {
+    }
+
+    public function format(LogRecord $record): string
+    {
+        $time = sprintf('%.4f', (float) $record->datetime->format('U.u'));
+        $level = strtolower($record->level->getName());
+        $prefix = "[{$time}]";
+        $message = $record->message;
+        $context = $this->formatContext($record->context);
+
+        if ($this->decorated) {
+            $prefix = $this->color($record->level, $prefix);
+            $level = $this->color($record->level, $this->symbol($record->level) . ' ' . $level);
+        }
+
+        return "{$prefix} {$level} {$message}{$context}\n";
+    }
+
+    /**
+     * @param array<LogRecord> $records
+     */
+    public function formatBatch(array $records): string
+    {
+        return implode('', array_map($this->format(...), $records));
+    }
+
+    /**
+     * @param array<string, mixed> $context
+     */
+    private function formatContext(array $context): string
+    {
+        if ($context === []) {
+            return '';
+        }
+
+        $parts = [];
+
+        foreach ($context as $key => $value) {
+            $parts[] = $key . '=' . $this->formatValue($value);
+        }
+
+        return ' ' . implode(' ', $parts);
+    }
+
+    private function formatValue(mixed $value): string
+    {
+        if ($value === null) {
+            return 'null';
+        }
+
+        if (is_bool($value)) {
+            return $value ? 'true' : 'false';
+        }
+
+        if (is_scalar($value)) {
+            $value = (string) $value;
+
+            return preg_match('/\s/', $value) ? json_encode($value, JSON_THROW_ON_ERROR) : $value;
+        }
+
+        return json_encode($value, JSON_UNESCAPED_SLASHES | JSON_THROW_ON_ERROR);
+    }
+
+    private function symbol(Level $level): string
+    {
+        return match (true) {
+            $level->value >= Level::Error->value => '✖',
+            $level === Level::Warning => '▲',
+            $level === Level::Debug => '·',
+            default => '•',
+        };
+    }
+
+    private function color(Level $level, string $value): string
+    {
+        $code = match (true) {
+            $level->value >= Level::Error->value => '31',
+            $level === Level::Warning => '33',
+            $level === Level::Notice => '36',
+            $level === Level::Debug => '2',
+            default => '32',
+        };
+
+        return "\033[{$code}m{$value}\033[0m";
+    }
+}
+
+final class LogFactory
+{
+    public static function create(Config $config): LoggerInterface
+    {
+        $handler = new StreamHandler($config->logFile ?? 'php://stderr', Level::fromName(strtoupper($config->logLevel)));
+        $handler->setFormatter(new HumanLogFormatter($config->logFile === null && self::stderrIsTty()));
+
+        return new MonologLogger('relay-cache-fuzzer', [$handler]);
+    }
+
+    private static function stderrIsTty(): bool
+    {
+        return defined('STDERR') && function_exists('stream_isatty') && stream_isatty(STDERR);
     }
 }
 
@@ -422,8 +535,10 @@ final class ServerProcess
     private RingBuffer $stdout;
     private RingBuffer $stderr;
 
-    public function __construct(private readonly Config $config)
-    {
+    public function __construct(
+        private readonly Config $config,
+        private readonly LoggerInterface $logger,
+    ) {
         $this->stdout = new RingBuffer(200);
         $this->stderr = new RingBuffer(200);
     }
@@ -451,13 +566,21 @@ final class ServerProcess
             ],
         );
         $this->process->setTimeout(null);
+        $this->logger->info('starting PHP CLI server', [
+            'host' => $this->config->host,
+            'port' => $this->config->port,
+            'workers' => $this->config->workers,
+        ]);
+        $this->logger->debug('server command line', ['command' => $this->process->getCommandLine()]);
         $this->process->start();
+
+        $this->logger->debug('server parent started', ['pid' => $this->process->getPid()]);
     }
 
     public function drain(): void
     {
-        $this->pushLines($this->stdout, $this->process->getIncrementalOutput());
-        $this->pushLines($this->stderr, $this->process->getIncrementalErrorOutput());
+        $this->pushLines($this->stdout, $this->process->getIncrementalOutput(), 'stdout');
+        $this->pushLines($this->stderr, $this->process->getIncrementalErrorOutput(), 'stderr');
     }
 
     public function isRunning(): bool
@@ -493,15 +616,17 @@ final class ServerProcess
     public function stop(): void
     {
         if (isset($this->process) && $this->process->isRunning()) {
+            $this->logger->info('stopping PHP CLI server', ['parent_pid' => $this->process->getPid()]);
             $this->process->stop(1.0, 15);
         }
     }
 
-    private function pushLines(RingBuffer $buffer, string $chunk): void
+    private function pushLines(RingBuffer $buffer, string $chunk, string $stream = 'server'): void
     {
         foreach (preg_split('/\r?\n/', $chunk) ?: [] as $line) {
             if ($line !== '') {
                 $buffer->push($line);
+                $this->logger->debug('server output', ['stream' => $stream, 'line' => $line]);
             }
         }
     }
@@ -514,6 +639,7 @@ final class Fuzzer
     private RedisClient $redis;
     private HttpClient $http;
     private ServerProcess $server;
+    private LoggerInterface $logger;
     private string $runId;
     private ?string $failurePath = null;
     private float $lastSuccessAt;
@@ -556,6 +682,7 @@ final class Fuzzer
     public function __construct(Config $config)
     {
         $this->config = $config->port === 0 ? $config->withPort(self::pickFreePort($config->host)) : $config;
+        $this->logger = LogFactory::create($this->config);
         $this->rng = new Rng($this->config->seed);
         $this->runId = dechex($this->config->seed) . '-' . bin2hex(random_bytes(3));
         $this->lastRequests = new RingBuffer(100);
@@ -566,9 +693,18 @@ final class Fuzzer
 
     public function run(): void
     {
-        echo "seed={$this->config->seed} run_id={$this->runId}\n";
-        echo "server=http://{$this->config->host}:{$this->config->port} workers={$this->config->workers}\n";
+        $this->logger->info('starting fuzz run', [
+            'seed' => $this->config->seed,
+            'run_id' => $this->runId,
+            'server' => "http://{$this->config->host}:{$this->config->port}",
+            'workers' => $this->config->workers,
+        ]);
 
+        $this->logger->debug('connecting to Redis', [
+            'host' => $this->config->redisHost,
+            'port' => $this->config->redisPort,
+            'db' => $this->config->redisDb,
+        ]);
         $this->redis = new RedisClient(
             $this->config->redisHost,
             $this->config->redisPort,
@@ -576,9 +712,10 @@ final class Fuzzer
             $this->config->requestTimeoutMs,
         );
         $this->redis->ping();
+        $this->logger->debug('Redis ping succeeded');
 
         $this->http = new HttpClient($this->config->host, $this->config->port, $this->config->requestTimeoutMs);
-        $this->server = new ServerProcess($this->config);
+        $this->server = new ServerProcess($this->config, $this->logger);
 
         try {
             $this->server->start();
@@ -593,9 +730,14 @@ final class Fuzzer
 
             $this->cleanupRedisKeys();
             $this->server->drain();
-            echo "completed iterations={$this->stats['iterations']} requests={$this->stats['total_requests']} stale_observations={$this->stats['stale_observations']}\n";
+            $this->logger->info('completed fuzz run', [
+                'iterations' => $this->stats['iterations'],
+                'requests' => $this->stats['total_requests'],
+                'stale_observations' => $this->stats['stale_observations'],
+            ]);
         } catch (Throwable $e) {
             $path = $this->failurePath ?? $this->writeReproducer('exception', ['message' => $e->getMessage()]);
+            $this->logger->error('fuzz run failed', ['error' => $e->getMessage(), 'reproducer' => $path]);
             throw new FuzzerException($e->getMessage() . "\nreproducer={$path}", previous: $e);
         } finally {
             $this->server->stop();
@@ -605,6 +747,7 @@ final class Fuzzer
     private function waitUntilReady(): void
     {
         $deadline = microtime(true) + 10.0;
+        $this->logger->debug('waiting for PHP CLI server to respond');
 
         while (microtime(true) < $deadline) {
             if (!$this->server->isRunning()) {
@@ -615,6 +758,7 @@ final class Fuzzer
                 $this->discoverWorkers(requireExpectedCount: false);
 
                 if ($this->observedPids !== []) {
+                    $this->logger->info('PHP CLI server is ready', ['workers_seen' => count($this->observedPids)]);
                     return;
                 }
             } catch (RequestException) {
@@ -628,6 +772,7 @@ final class Fuzzer
 
     private function deterministicSmoke(): void
     {
+        $this->logger->info('running deterministic smoke phase');
         $this->discoverWorkers(requireExpectedCount: true);
         $this->warmSome(max(8, $this->config->workers * $this->config->keysPerWorker * 3));
 
@@ -644,11 +789,13 @@ final class Fuzzer
         }
 
         $this->verifyKeys($keys);
+        $this->logger->info('deterministic smoke phase completed', ['keys' => count($keys)]);
     }
 
     private function iteration(): void
     {
         $this->stats['iterations']++;
+        $this->logger->debug('starting iteration', ['iteration' => $this->stats['iterations']]);
         $this->ensureServerRunning();
         $this->discoverWorkers(requireExpectedCount: false);
         $this->warmSome(max(2, $this->config->workers * 2));
@@ -664,12 +811,17 @@ final class Fuzzer
 
         $this->verifyKeys($mutated);
         $this->checkWatchdog();
+        $this->logger->debug('completed iteration', [
+            'iteration' => $this->stats['iterations'],
+            'mutated_keys' => count($mutated),
+        ]);
     }
 
     private function discoverWorkers(bool $requireExpectedCount): void
     {
         $target = $requireExpectedCount ? $this->config->workers : 1;
         $attempts = max(20, $this->config->workers * 20);
+        $this->logger->debug('discovering workers', ['target' => $target, 'attempts' => $attempts]);
 
         for ($i = 0; $i < $attempts && count($this->observedPids) < $target; $i++) {
             $response = $this->tryRequest('/pid');
@@ -699,9 +851,7 @@ final class Fuzzer
         $this->stats['workers_discovered']++;
         $this->assignKeys($pid);
 
-        if ($this->config->verbose) {
-            echo "discovered worker pid={$pid}\n";
-        }
+        $this->logger->notice('discovered worker', ['pid' => $pid, 'known_workers' => count($this->observedPids)]);
     }
 
     private function assignKeys(int $pid): void
@@ -714,6 +864,7 @@ final class Fuzzer
 
         for ($slot = 0; $slot < $this->config->keysPerWorker; $slot++) {
             $key = "relay-fuzz:{$this->runId}:{$pid}:{$slot}";
+            $this->logger->debug('seeding Redis key for cache warmup', ['pid' => $pid, 'key' => $key, 'value' => 0]);
             $this->redis->set($key, '0');
             $this->expected[$key] = 0;
             $this->keyOwner[$key] = $pid;
@@ -726,6 +877,8 @@ final class Fuzzer
 
     private function warmSome(int $rounds): void
     {
+        $this->logger->debug('warming keys through Relay', ['rounds' => $rounds, 'reads_per_round' => $this->config->warmupReads]);
+
         for ($i = 0; $i < $rounds; $i++) {
             $pids = array_keys($this->keysByPid);
 
@@ -736,6 +889,12 @@ final class Fuzzer
 
             $pid = $this->rng->pick($pids);
             $key = $this->rng->pick($this->keysByPid[$pid]);
+            $this->logger->debug('attempting to cache key through Relay', [
+                'round' => $i + 1,
+                'pid_hint' => $pid,
+                'key' => $key,
+                'reads' => $this->config->warmupReads,
+            ]);
             $response = $this->tryRequest('/warm?key=' . rawurlencode($key) . '&n=' . $this->config->warmupReads);
 
             if ($response === null) {
@@ -777,12 +936,18 @@ final class Fuzzer
      */
     private function mutateKeys(array $keys): void
     {
+        if ($keys !== []) {
+            $this->logger->debug('mutating Redis keys directly', ['keys' => count($keys)]);
+        }
+
         foreach ($keys as $key) {
+            $this->logger->debug('incrementing Redis key', ['key' => $key, 'old_expected' => $this->expected[$key] ?? null]);
             $value = $this->redis->incr($key);
             $this->expected[$key] = $value;
             $event = ['type' => 'incr', 'key' => $key, 'value' => (string) $value];
             $this->recordEvent($event);
             $this->lastMutations->push($event);
+            $this->logger->debug('incremented Redis key', ['key' => $key, 'value' => $value]);
         }
     }
 
@@ -796,11 +961,13 @@ final class Fuzzer
         }
 
         if ($pids === []) {
+            $this->logger->debug('no worker PIDs available to kill');
             return;
         }
 
         $pids = $this->rng->shuffled($pids);
         $count = $this->rng->int(1, min($this->config->maxKill, count($pids)));
+        $this->logger->debug('selected workers for killing', ['count' => $count, 'candidates' => $pids]);
 
         foreach (array_slice($pids, 0, $count) as $pid) {
             $this->killPid($pid, $this->rng->weighted($this->config->signalWeights));
@@ -816,14 +983,17 @@ final class Fuzzer
         $parentPid = $this->server->parentPid();
 
         if ($parentPid !== null && $pid === $parentPid) {
+            $this->logger->debug('skipping kill for server parent', ['pid' => $pid]);
             return;
         }
 
+        $signalName = self::signalName($signal);
+        $this->logger->notice('killing worker process', ['pid' => $pid, 'signal' => $signalName]);
         $ok = @posix_kill($pid, $signal);
         $event = [
             'type' => 'kill',
             'pid' => $pid,
-            'signal' => self::signalName($signal),
+            'signal' => $signalName,
             'ok' => $ok,
         ];
         $this->recordEvent($event);
@@ -832,10 +1002,9 @@ final class Fuzzer
         if ($ok) {
             unset($this->observedPids[$pid]);
             $this->stats['workers_killed']++;
-
-            if ($this->config->verbose) {
-                echo "killed pid={$pid} signal=" . self::signalName($signal) . "\n";
-            }
+            $this->logger->notice('sent worker signal', ['pid' => $pid, 'signal' => $signalName]);
+        } else {
+            $this->logger->warning('failed to signal worker', ['pid' => $pid, 'signal' => $signalName]);
         }
     }
 
@@ -844,15 +1013,25 @@ final class Fuzzer
      */
     private function verifyKeys(array $keys): void
     {
+        if ($keys !== []) {
+            $this->logger->debug('verifying keys through Relay', ['keys' => count($keys), 'retries' => $this->config->verifyRetries]);
+        }
+
         foreach ($keys as $key) {
             $expected = (string) $this->expected[$key];
             $lastMismatch = null;
 
             for ($attempt = 1; $attempt <= $this->config->verifyRetries; $attempt++) {
+                $this->logger->debug('doing verification read', [
+                    'key' => $key,
+                    'expected' => $expected,
+                    'attempt' => $attempt,
+                ]);
                 $response = $this->tryRequest('/get?key=' . rawurlencode($key));
 
                 if ($response === null) {
                     $lastMismatch = ['type' => 'request_failed', 'attempt' => $attempt];
+                    $this->logger->debug('verification read failed; retrying', ['key' => $key, 'attempt' => $attempt]);
                     $this->delayBetweenVerifyAttempts();
                     continue;
                 }
@@ -873,15 +1052,35 @@ final class Fuzzer
                 $this->recordEvent($event);
 
                 if ($value === $expected) {
+                    $this->logger->debug('verification read matched', [
+                        'key' => $key,
+                        'pid' => $pid,
+                        'value' => $value,
+                        'attempt' => $attempt,
+                    ]);
                     $lastMismatch = null;
                     break;
                 }
 
                 $lastMismatch = $event;
+                $this->logger->warning('verification read mismatch', [
+                    'key' => $key,
+                    'pid' => $pid,
+                    'value' => $value,
+                    'expected' => $expected,
+                    'attempt' => $attempt,
+                ]);
 
                 if ($value !== null && ctype_digit($value) && (int) $value < (int) $expected) {
                     $this->stats['stale_observations']++;
                     $this->lastStale->push($event);
+                    $this->logger->warning('observed stale Relay value', [
+                        'key' => $key,
+                        'pid' => $pid,
+                        'value' => $value,
+                        'expected' => $expected,
+                        'attempt' => $attempt,
+                    ]);
                 }
 
                 $this->delayBetweenVerifyAttempts();
@@ -890,6 +1089,11 @@ final class Fuzzer
             if ($lastMismatch !== null) {
                 $this->stats['persistent_stale_failures']++;
                 $redisValue = $this->redis->get($key);
+                $this->logger->error('persistent mismatch after verification retries', [
+                    'key' => $key,
+                    'expected' => $expected,
+                    'redis_value' => $redisValue,
+                ]);
                 $this->abort('Persistent stale or mismatched value', [
                     'key' => $key,
                     'expected' => $expected,
@@ -905,13 +1109,16 @@ final class Fuzzer
     private function delayBetweenVerifyAttempts(): void
     {
         if ($this->config->verifyDelayUs > 0) {
+            $this->logger->debug('waiting before another read', ['delay_us' => $this->config->verifyDelayUs]);
             usleep($this->config->verifyDelayUs);
         }
     }
 
     private function cleanupRedisKeys(): void
     {
-        $this->redis->del(array_keys($this->expected));
+        $keys = array_keys($this->expected);
+        $this->logger->debug('cleaning Redis keys', ['keys' => count($keys)]);
+        $this->redis->del($keys);
     }
 
     /**
@@ -921,15 +1128,22 @@ final class Fuzzer
     {
         $this->stats['total_requests']++;
         $startedAt = microtime(true);
+        $this->logger->debug('sending request', ['path' => $path]);
 
         try {
             $response = $this->http->getJson($path);
             $this->stats['successful_requests']++;
             $this->lastSuccessAt = microtime(true);
+            $elapsedMs = (int) round((microtime(true) - $startedAt) * 1000);
             $this->lastRequests->push([
                 'path' => $path,
                 'ok' => true,
-                'elapsed_ms' => (int) round((microtime(true) - $startedAt) * 1000),
+                'elapsed_ms' => $elapsedMs,
+                'pid' => $response['pid'] ?? null,
+            ]);
+            $this->logger->debug('request completed', [
+                'path' => $path,
+                'elapsed_ms' => $elapsedMs,
                 'pid' => $response['pid'] ?? null,
             ]);
 
@@ -941,12 +1155,19 @@ final class Fuzzer
                 $this->stats['request_timeouts']++;
             }
 
+            $elapsedMs = (int) round((microtime(true) - $startedAt) * 1000);
             $this->lastRequests->push([
                 'path' => $path,
                 'ok' => false,
                 'timeout' => $e->timedOut,
                 'error' => $e->getMessage(),
-                'elapsed_ms' => (int) round((microtime(true) - $startedAt) * 1000),
+                'elapsed_ms' => $elapsedMs,
+            ]);
+            $this->logger->warning('request failed', [
+                'path' => $path,
+                'timeout' => $e->timedOut,
+                'elapsed_ms' => $elapsedMs,
+                'error' => $e->getMessage(),
             ]);
             $this->checkWatchdog();
 
@@ -998,6 +1219,7 @@ final class Fuzzer
      */
     private function abort(string $message, array $context = []): never
     {
+        $this->logger->error('aborting fuzz run', ['reason' => $message, 'context' => $context]);
         $this->failurePath = $this->writeReproducer($message, $context);
 
         throw new FuzzerException("{$message}\nreproducer={$this->failurePath}");
@@ -1046,6 +1268,7 @@ final class Fuzzer
         ];
 
         file_put_contents($path, json_encode($payload, JSON_PRETTY_PRINT | JSON_THROW_ON_ERROR) . "\n");
+        $this->logger->error('wrote failure reproducer', ['path' => $path, 'reason' => $reason]);
 
         return $path;
     }
@@ -1087,10 +1310,12 @@ final class ReplayRunner
     private RedisClient $redis;
     private HttpClient $http;
     private ServerProcess $server;
+    private LoggerInterface $logger;
 
     public function __construct(Config $config)
     {
         $this->config = $config->port === 0 ? $config->withPort($this->pickFreePort($config->host)) : $config;
+        $this->logger = LogFactory::create($this->config);
     }
 
     public function run(): void
@@ -1099,6 +1324,7 @@ final class ReplayRunner
             throw new FuzzerException('Replay file is required');
         }
 
+        $this->logger->info('starting replay', ['file' => $this->config->replayFile]);
         $raw = file_get_contents($this->config->replayFile);
 
         if ($raw === false) {
@@ -1118,7 +1344,7 @@ final class ReplayRunner
             $this->config->requestTimeoutMs,
         );
         $this->http = new HttpClient($this->config->host, $this->config->port, $this->config->requestTimeoutMs);
-        $this->server = new ServerProcess($this->config);
+        $this->server = new ServerProcess($this->config, $this->logger);
 
         try {
             $this->server->start();
@@ -1130,7 +1356,7 @@ final class ReplayRunner
                 }
             }
 
-            echo "replay completed file={$this->config->replayFile}\n";
+            $this->logger->info('replay completed', ['file' => $this->config->replayFile]);
         } finally {
             $this->server->stop();
         }
@@ -1144,29 +1370,35 @@ final class ReplayRunner
         $type = $event['type'] ?? null;
 
         if ($type === 'set' && isset($event['key'], $event['value']) && is_string($event['key'])) {
+            $this->logger->debug('replay set', ['key' => $event['key'], 'value' => (string) $event['value']]);
             $this->redis->set($event['key'], (string) $event['value']);
             return;
         }
 
         if ($type === 'incr' && isset($event['key']) && is_string($event['key'])) {
+            $this->logger->debug('replay incr', ['key' => $event['key']]);
             $this->redis->incr($event['key']);
             return;
         }
 
         if ($type === 'warm' && isset($event['key']) && is_string($event['key'])) {
             $reads = isset($event['reads']) && is_int($event['reads']) ? $event['reads'] : $this->config->warmupReads;
+            $this->logger->debug('replay warm read', ['key' => $event['key'], 'reads' => $reads]);
             $this->http->getJson('/warm?key=' . rawurlencode($event['key']) . '&n=' . $reads);
             return;
         }
 
         if ($type === 'get' && isset($event['key']) && is_string($event['key'])) {
+            $this->logger->debug('replay get', ['key' => $event['key']]);
             $response = $this->http->getJson('/get?key=' . rawurlencode($event['key']));
             $expected = $event['expected'] ?? null;
 
             if ($expected !== null && (string) ($response['value'] ?? '') !== (string) $expected) {
-                echo 'replay mismatch key=' . $event['key']
-                    . ' expected=' . (string) $expected
-                    . ' got=' . (string) ($response['value'] ?? 'null') . "\n";
+                $this->logger->warning('replay mismatch', [
+                    'key' => $event['key'],
+                    'expected' => (string) $expected,
+                    'got' => (string) ($response['value'] ?? 'null'),
+                ]);
             }
 
             return;
@@ -1177,6 +1409,7 @@ final class ReplayRunner
             $signal = self::signalNumber(is_string($event['signal'] ?? null) ? $event['signal'] : 'SIGTERM');
 
             if ($pid !== null && function_exists('posix_kill')) {
+                $this->logger->notice('replay kill', ['pid' => $pid, 'signal' => self::signalName($signal)]);
                 @posix_kill($pid, $signal);
             }
         }
@@ -1185,10 +1418,12 @@ final class ReplayRunner
     private function waitForPid(): void
     {
         $deadline = microtime(true) + 10.0;
+        $this->logger->debug('waiting for replay server to respond');
 
         while (microtime(true) < $deadline) {
             try {
                 $this->http->getJson('/pid');
+                $this->logger->info('replay server is ready');
                 return;
             } catch (RequestException) {
                 usleep(50_000);
@@ -1224,6 +1459,16 @@ final class ReplayRunner
             'SIGINT', 'INT' => 2,
             'SIGKILL', 'KILL' => 9,
             default => 15,
+        };
+    }
+
+    private static function signalName(int $signal): string
+    {
+        return match ($signal) {
+            2 => 'SIGINT',
+            9 => 'SIGKILL',
+            15 => 'SIGTERM',
+            default => 'SIG' . $signal,
         };
     }
 }

@@ -51,6 +51,7 @@ bin/relay-cache-fuzzer \
   --warmup-reads=32 \
   --verify-retries=12 \
   --verify-delay-us=50000 \
+  --log-level=debug \
   --relay-max-endpoint-dbs=2 \
   --relay-max-db-writers=2 \
   --kill-rate=0.35 \
@@ -112,6 +113,8 @@ Common options:
 - `--request-timeout-ms=N`
 - `--watchdog-timeout-ms=N`
 - `--signal-mix=TERM:60,INT:20,KILL:20`
+- `--log-level=info`: one of `debug`, `info`, `notice`, `warning`, `error`, `critical`, `alert`, `emergency`. `--verbose` is equivalent to `--log-level=debug` unless an explicit level is passed.
+- `--log-file=PATH`: write human diagnostics to a file instead of stderr.
 - `--verbose`
 - `--keep-temp`
 - `--fail-fast`
@@ -140,6 +143,12 @@ The file includes:
 - request, mutation, and stale-observation tails
 - server stdout and stderr tails
 - the event stream leading to failure
+
+Human diagnostics are written to stderr by default, or to `--log-file` when
+specified. TTY logs use concise microtime prefixes and rich styling for humans;
+file logs stay plain text. Use `--log-level=debug` to see individual cache
+warmups, verification reads, Redis mutations, worker signal attempts, retries,
+and server output.
 
 Replay an event stream with:
 

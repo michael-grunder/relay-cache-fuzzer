@@ -30,6 +30,8 @@ final class Config
         public readonly int $requestTimeoutMs,
         public readonly int $watchdogTimeoutMs,
         public readonly bool $verbose,
+        public readonly string $logLevel,
+        public readonly ?string $logFile,
         public readonly bool $keepTemp,
         public readonly bool $failFast,
         public readonly array $signalWeights,
@@ -44,6 +46,7 @@ final class Config
     {
         $raw = self::parseArgv($argv);
         $seed = isset($raw['seed']) ? self::int($raw, 'seed') : random_int(1, PHP_INT_MAX);
+        $verbose = self::bool($raw, 'verbose');
 
         return new self(
             php: self::string($raw, 'php', PHP_BINARY),
@@ -65,7 +68,9 @@ final class Config
             verifyDelayUs: max(0, self::int($raw, 'verify-delay-us', 50000)),
             requestTimeoutMs: max(1, self::int($raw, 'request-timeout-ms', 1000)),
             watchdogTimeoutMs: max(1, self::int($raw, 'watchdog-timeout-ms', 5000)),
-            verbose: self::bool($raw, 'verbose'),
+            verbose: $verbose,
+            logLevel: self::logLevel(self::string($raw, 'log-level', $verbose ? 'debug' : 'info')),
+            logFile: isset($raw['log-file']) ? self::string($raw, 'log-file') : null,
             keepTemp: self::bool($raw, 'keep-temp'),
             failFast: self::bool($raw, 'fail-fast'),
             signalWeights: self::parseSignalMix(self::string($raw, 'signal-mix', 'TERM:60,INT:20,KILL:20')),
@@ -96,6 +101,8 @@ final class Config
             requestTimeoutMs: $this->requestTimeoutMs,
             watchdogTimeoutMs: $this->watchdogTimeoutMs,
             verbose: $this->verbose,
+            logLevel: $this->logLevel,
+            logFile: $this->logFile,
             keepTemp: $this->keepTemp,
             failFast: $this->failFast,
             signalWeights: $this->signalWeights,
@@ -150,7 +157,8 @@ final class Config
         echo "--workers, --duration, --seed, --relay-max-endpoint-dbs,\n";
         echo "--relay-max-db-writers, --kill-rate, --max-kill, --keys-per-worker,\n";
         echo "--warmup-reads, --verify-retries, --verify-delay-us,\n";
-        echo "--request-timeout-ms, --signal-mix, --replay, --verbose,\n";
+        echo "--request-timeout-ms, --signal-mix, --log-level, --log-file,\n";
+        echo "--replay, --verbose,\n";
         echo "--keep-temp, and --fail-fast.\n";
     }
 
@@ -208,6 +216,23 @@ final class Config
     private static function bool(array $raw, string $key): bool
     {
         return isset($raw[$key]) && $raw[$key] !== '0' && $raw[$key] !== 'false';
+    }
+
+    private static function logLevel(string $level): string
+    {
+        $level = strtolower($level);
+
+        if ($level === 'warn') {
+            return 'warning';
+        }
+
+        $levels = ['debug', 'info', 'notice', 'warning', 'error', 'critical', 'alert', 'emergency'];
+
+        if (!in_array($level, $levels, true)) {
+            throw new FuzzerException('--log-level must be one of debug, info, notice, warning, error, critical, alert, emergency');
+        }
+
+        return $level;
     }
 
     /**
