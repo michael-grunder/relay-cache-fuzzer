@@ -1,0 +1,388 @@
+Sequential Fuzzing Mode
+=======================
+
+Overview
+--------
+
+Add a new fuzzing mode called "sequential".
+
+Unlike the normal randomized fuzzer, sequential mode intentionally walks
+through worker shutdown scenarios in a deterministic and highly observable
+way. The goal is to identify stale-cache conditions related to worker
+termination, key ownership, invalidation propagation, signal handling,
+shutdown handlers, atexit handlers, and cache lease reclamation.
+
+This mode prioritizes reproducibility and debugging over throughput.
+
+The basic idea is:
+
+1. Spawn N workers.
+2. Ensure every worker caches one or more known keys.
+3. Repeatedly:
+   - Kill a worker.
+   - Mutate keys that may have been cached by that worker.
+   - Query those keys through surviving workers.
+   - Verify no persistent stale values are observed.
+4. Continue until only one worker remains.
+5. Verify keys one final time.
+6. Kill the last worker.
+7. End the run.
+
+This produces a predictable sequence of events that is easy to understand,
+debug, and replay.
+
+
+Command Line Options
+--------------------
+
+Sequential mode should accept most or all options supported by the existing
+fuzzer, including:
+
+    --php
+    --host
+    --port
+    --workers
+    --seed
+    --redis-host
+    --redis-port
+    --redis-db
+    --relay-max-endpoint-dbs
+    --relay-max-db-writers
+
+In addition it should support:
+
+    --delay-us=N
+
+        Delay between sequential operations.
+
+        This exists because Relay uses wait-free reads and invalidations are
+        not necessarily visible to every worker at exactly the same instant.
+
+        Default should be small but nonzero.
+
+    --rr
+
+        Run the PHP CLI server under rr record.
+
+        If stale data is detected, preserve the rr trace directory and include
+        it with the generated reproducer.
+
+    --rr-trace-dir=/path
+
+        Optional explicit rr trace root.
+
+        If omitted, generate a temporary directory.
+
+
+Worker Discovery
+----------------
+
+Sequential mode requires knowing which workers exist.
+
+The coordinator should repeatedly hit an endpoint that returns:
+
+    {
+        "pid": 12345
+    }
+
+until all workers have been observed.
+
+Each worker should then be assigned one or more keys.
+
+Example:
+
+    relay-fuzz:<run>:<pid>:0
+    relay-fuzz:<run>:<pid>:1
+    relay-fuzz:<run>:<pid>:2
+
+The coordinator maintains:
+
+    pid -> keys[]
+
+for the lifetime of the run.
+
+
+Warmup Phase
+------------
+
+The goal of warmup is to ensure every worker has touched and potentially
+cached its assigned keys.
+
+For each discovered worker:
+
+1. Route requests until that worker responds.
+2. Request its assigned keys.
+3. Confirm Relay reports the keys as tracked when possible.
+4. Record:
+
+       pid
+       key
+       tracked state
+
+The warmup phase completes once all workers have touched all assigned keys.
+
+Rich logging should make it obvious which workers have completed warmup.
+
+
+Sequential Shutdown Loop
+------------------------
+
+Once warmup is complete:
+
+    alive_workers = all_workers
+
+Loop until only one worker remains.
+
+For each iteration:
+
+1. Select a worker to terminate.
+
+   The selection strategy may be:
+
+       random
+       oldest
+       newest
+
+   Initially random is sufficient.
+
+2. Record:
+
+       timestamp
+       pid
+       signal
+
+3. Terminate the worker.
+
+4. Wait for worker death to be observed.
+
+5. Mutate keys associated with the terminated worker.
+
+   This can simply be:
+
+       INCR key
+
+   for every key owned by that worker.
+
+6. Update expected values.
+
+7. Query those same keys via surviving workers.
+
+8. Verify:
+
+       returned_value == expected_value
+
+9. Log results.
+
+10. Sleep for delay-us if configured.
+
+11. Remove worker from alive_workers.
+
+Repeat.
+
+
+Verification Semantics
+----------------------
+
+Relay's cache is not expected to provide perfect instantaneous visibility
+during concurrent activity.
+
+Therefore sequential mode should distinguish between:
+
+    transient stale observations
+
+and
+
+    persistent stale observations
+
+A transient stale observation should be logged but not immediately fail.
+
+The coordinator should retry reads according to configured verification
+parameters.
+
+A failure occurs if:
+
+    stale value survives all verification retries
+
+or
+
+    stale value is repeatedly served by surviving workers
+
+or
+
+    stale value survives after the original worker has exited
+
+
+Final Worker Phase
+------------------
+
+Once only a single worker remains:
+
+1. Mutate every known key.
+2. Verify every known key.
+3. Record final cache state.
+4. Kill the final worker.
+5. Confirm worker termination.
+6. End run.
+
+This ensures the entire worker population has been cycled.
+
+
+RR Recording Mode
+-----------------
+
+When --rr is specified, the PHP CLI server should be launched under:
+
+    rr record
+
+instead of invoking PHP directly.
+
+Example:
+
+    rr record php -S ...
+
+The implementation should support:
+
+    _RR_TRACE_DIR=/path
+
+to force traces into a known location.
+
+Example:
+
+    _RR_TRACE_DIR=/tmp/relay-fuzz-1234
+
+The fuzzer should create a unique trace directory for each run.
+
+
+RR Failure Capture
+------------------
+
+If stale data is detected:
+
+1. Stop further fuzzing activity.
+2. Preserve the rr trace.
+3. Generate a reproducer bundle.
+4. Report bundle location.
+
+The bundle should contain:
+
+    reproducer.json
+    startup.json
+    rr trace
+
+The startup metadata should include:
+
+    seed
+    timestamp
+    command line
+    PHP executable
+    Relay INI values
+    worker count
+    Redis endpoint
+    signal strategy
+    delay settings
+
+This should be sufficient to understand exactly how the run was configured.
+
+
+Handling Incomplete RR Traces
+-----------------------------
+
+rr creates an "incomplete" file while the trace is still being finalized.
+
+Example:
+
+    data
+    events
+    incomplete
+    mmaps
+    tasks
+
+The fuzzer must not capture or archive a trace while the "incomplete" file
+exists.
+
+When preserving a trace:
+
+1. Detect the trace directory.
+2. Poll for the absence of:
+
+       trace_dir/incomplete
+
+3. Wait until rr has finished finalizing the trace.
+4. Only then copy/archive/preserve it.
+
+This avoids capturing partially written traces.
+
+
+Reproducer Bundle
+-----------------
+
+Every failure should generate a self-contained reproducer directory.
+
+Suggested layout:
+
+    reproducer/
+        startup.json
+        reproducer.json
+        events.log
+        server.stdout
+        server.stderr
+        rr/
+
+startup.json contains:
+
+    seed
+    php executable
+    command line
+    relay ini values
+    redis configuration
+    worker count
+
+reproducer.json contains:
+
+    event stream
+    worker lifecycle
+    key mutations
+    stale observations
+
+events.log contains a human-readable timeline.
+
+
+Logging
+-------
+
+Sequential mode should be highly verbose.
+
+Example:
+
+    [DISCOVER] pid=1234
+    [DISCOVER] pid=1235
+    [DISCOVER] pid=1236
+
+    [WARM] pid=1234 key=relay-fuzz:1234:0 tracked=yes
+    [WARM] pid=1235 key=relay-fuzz:1235:0 tracked=yes
+
+    [KILL] pid=1235 signal=SIGTERM
+
+    [INVALIDATE] key=relay-fuzz:1235:0 expected=4
+
+    [VERIFY] pid=1234 key=relay-fuzz:1235:0 value=4
+    [VERIFY] pid=1236 key=relay-fuzz:1235:0 value=4
+
+    [OK] worker shutdown validated
+
+The intent is that a developer can watch the run live and immediately
+understand what is happening.
+
+
+Primary Goal
+------------
+
+Sequential mode exists to answer a very specific question:
+
+    "If a worker that may have cached keys disappears, can Relay ever
+     continue serving stale values indefinitely?"
+
+The mode intentionally sacrifices randomness in favor of a deterministic,
+easy-to-debug sequence of worker death, invalidation, and verification,
+with optional rr capture making any discovered bug straightforward to
+reproduce and investigate.
