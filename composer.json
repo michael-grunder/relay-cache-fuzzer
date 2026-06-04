@@ -1,0 +1,17 @@
+{
+    "name": "michael-grunder/relay-cache-fuzzer",
+    "type": "project",
+    "license": "MIT",
+    "autoload": {
+        "psr-4": {
+            "MichaelGrunder\\RelayCacheFuzzer\\": "src/"
+        }
+    },
+    "authors": [
+        {
+            "name": "michael-grunder",
+            "email": "michael.grunder@gmail.com"
+        }
+    ],
+    "require": {}
+}

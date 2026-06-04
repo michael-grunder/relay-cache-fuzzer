@@ -1,0 +1,481 @@
+Relay stale-cache worker-death fuzzer
+====================================
+
+Goal
+----
+
+Stress Relay's process/worker cache invalidation behavior when PHP worker
+processes die at awkward times.
+
+The fuzzer should verify that keys cached by a worker do not remain stale
+forever after that worker exits, is killed, or is replaced. The main bug class
+is: a worker dies while owning cached keys or writer slots, but Relay later
+continues to serve stale values because invalidation state was not observed or
+because a stale db/key lease remained usable.
+
+This is not a strict linearizability tester. Relay has lock-free read paths, so
+short-lived races under concurrent mutation are acceptable. The failure condition
+is a stale value that persists across repeated reads after Redis has been
+updated and enough time/retries have passed.
+
+
+High-level approach
+-------------------
+
+Use PHP's built-in CLI server with PHP_CLI_SERVER_WORKERS=N to emulate a small
+forking worker pool.
+
+The harness starts:
+
+1. A Redis instance or connects to an existing Redis endpoint.
+2. A PHP CLI server using a configurable PHP binary.
+3. A router script exposing test endpoints.
+4. A driver process that repeatedly:
+   - Discovers worker PIDs.
+   - Assigns each worker PID its own Redis keys.
+   - Forces workers to read/cache their assigned keys.
+   - Mutates the corresponding Redis values directly.
+   - Randomly kills one or more workers.
+   - Continues querying the server.
+   - Checks that stale cached values do not persist.
+
+
+Required configuration
+----------------------
+
+The fuzzer should accept at least:
+
+--php=/path/to/php
+    PHP binary to run with -S.
+
+--host=127.0.0.1
+--port=0
+    Host/port for the CLI server. port=0 means choose a free port.
+
+--redis-host=127.0.0.1
+--redis-port=6379
+--redis-db=0
+
+--workers=N
+    Number of PHP_CLI_SERVER_WORKERS.
+
+--duration=SECONDS
+    Total fuzzing duration.
+
+--seed=N
+    Deterministic RNG seed. If omitted, generate one and print it.
+
+--relay-max-endpoint-dbs=N
+    INI value for relay.max_endpoint_dbs.
+
+--relay-max-db-writers=N
+    INI value for relay.max_db_writers.
+
+--kill-rate=FLOAT
+    Approximate probability of killing workers during an iteration.
+
+--max-kill=N
+    Maximum workers to kill in one iteration.
+
+--keys-per-worker=N
+    Number of keys assigned per observed worker PID.
+
+--warmup-reads=N
+    Reads per key before considering the key likely cached.
+
+--verify-retries=N
+    Number of post-mutation verification attempts.
+
+--verify-delay-us=N
+    Delay between verification attempts.
+
+--request-timeout-ms=N
+    HTTP request timeout.
+
+--verbose
+--keep-temp
+--fail-fast
+
+
+Composer dependencies
+---------------------
+
+Useful packages:
+
+- symfony/process
+- symfony/http-client or guzzlehttp/guzzle
+- predis/predis, or ext-redis if preferred
+- symfony/console, optional but useful
+
+
+PHP CLI server process
+----------------------
+
+Start the server with something equivalent to:
+
+PHP_CLI_SERVER_WORKERS=N \
+php \
+    -d relay.max_endpoint_dbs=X \
+    -d relay.max_db_writers=Y \
+    -d relay.cache=1 \
+    -S 127.0.0.1:PORT \
+    router.php
+
+The PHP binary path must be configurable.
+
+The harness should capture stdout/stderr from the server process. The built-in
+server parent process should be tracked separately from worker processes.
+
+Worker PIDs can be discovered by:
+
+1. Having endpoints return getmypid().
+2. Repeatedly hitting /pid until all expected worker PIDs are observed.
+3. Optionally using procfs/ps to discover children of the server parent.
+
+The endpoint-based method should be the primary mechanism because it proves the
+PID is actually serving requests.
+
+
+Router script endpoints
+-----------------------
+
+The router script should be tiny and deterministic.
+
+It should create a Relay connection:
+
+$r = new Relay\Relay($host, $port);
+
+Suggested endpoints:
+
+GET /pid
+    Returns JSON:
+    {
+      "pid": 1234
+    }
+
+GET /get?key=KEY
+    Does:
+      $value = $r->get(KEY)
+      $tracked = $r->isTracked(KEY)
+    Returns JSON:
+    {
+      "pid": 1234,
+      "key": KEY,
+      "value": VALUE_OR_NULL,
+      "tracked": true|false
+    }
+
+GET /warm?key=KEY&n=N
+    Repeatedly calls get(KEY) N times, then returns:
+    {
+      "pid": 1234,
+      "key": KEY,
+      "value": LAST_VALUE,
+      "tracked": true|false,
+      "reads": N
+    }
+
+GET /tracked?key=KEY
+    Returns:
+    {
+      "pid": 1234,
+      "key": KEY,
+      "tracked": true|false
+    }
+
+GET /many?prefix=PFX&n=N
+    Optional helper to touch many keys from a single request.
+
+The router should not mutate Redis. Redis mutations should come from the
+external driver so that server-side cached state can become stale.
+
+
+Key design
+----------
+
+Use string keys only.
+
+Key format:
+
+relay-fuzz:{run_id}:{pid}:{slot}
+
+Example:
+
+relay-fuzz:abc123:233261:7
+
+Value format:
+
+generation integer encoded as decimal string.
+
+Initial value:
+
+"0"
+
+Mutation:
+
+INCR key
+
+The driver maintains expected[key] = latest generation observed from Redis.
+
+
+Basic iteration
+---------------
+
+1. Discover worker PIDs.
+
+2. For each observed PID, create keys:
+
+   relay-fuzz:{run_id}:{pid}:0
+   relay-fuzz:{run_id}:{pid}:1
+   ...
+   relay-fuzz:{run_id}:{pid}:{keys_per_worker - 1}
+
+3. Initialize all keys in Redis to "0".
+
+4. Warm workers:
+
+   For many rounds, send requests to /warm for keys belonging to the PID that
+   handled the request.
+
+   Since the CLI server load-balances requests and we cannot directly choose a
+   worker, the driver should adapt:
+
+   - Send /pid or /get requests.
+   - Observe the returned pid.
+   - Select one of that pid's assigned keys.
+   - Hit /warm?key=that_key&n=warmup_reads.
+   - Record whether Relay reported tracked=true.
+
+5. Mutate keys directly in Redis:
+
+   - Pick a subset of keys.
+   - INCR each selected key.
+   - Update expected[key].
+
+6. Randomly kill workers:
+
+   - Pick 1..max_kill currently observed worker PIDs.
+   - Send SIGTERM, SIGINT, SIGKILL, or a configured weighted mix.
+   - Prefer SIGTERM/SIGINT early because signal/atexit behavior is relevant.
+   - Include SIGKILL sometimes to model abrupt death.
+
+7. Rediscover worker PIDs:
+
+   - The CLI server should respawn workers if applicable.
+   - Continue until at least one worker responds.
+   - Do not require the exact same worker count immediately.
+
+8. Verification phase:
+
+   For each mutated key, repeatedly query /get?key=KEY.
+
+   A response is stale if:
+
+   response.value is not equal to expected[key]
+
+   A stale response is tolerated transiently, but only up to verify_retries.
+   If the key still returns an older generation after all retries, record a
+   failure.
+
+   Stronger useful failure signal:
+
+   - The same stale value is returned repeatedly by the same PID.
+   - tracked=true is returned while value is stale.
+   - The stale value survives worker death/replacement.
+   - The stale value survives additional Redis INCRs.
+
+
+Important invariants
+--------------------
+
+Hard failure:
+
+- A key returns generation G when Redis currently stores generation H, where
+  G < H, and this persists for verify_retries attempts with delays.
+
+- A key assigned to a dead PID remains stale after that PID is gone and at
+  least one replacement worker has served verification reads.
+
+- The server stops making progress, requests time out repeatedly, or the parent
+  server process exits unexpectedly.
+
+- The harness detects a stuck request pattern consistent with ck_rhs_next or
+  another infinite loop.
+
+Soft signal / logging:
+
+- tracked=true for stale value.
+- tracked=false for stale value.
+- repeated timeouts from one PID before it dies.
+- worker count does not recover.
+- server stderr contains warnings, fatal errors, assertions, or crashes.
+
+
+Progress watchdog
+-----------------
+
+The driver should maintain:
+
+- total requests
+- successful requests
+- failed requests
+- request timeouts
+- stale observations
+- persistent stale failures
+- workers discovered
+- workers killed
+- worker exits by signal/status
+
+If no successful request completes for watchdog_timeout_ms, fail the run and
+dump diagnostics.
+
+Diagnostics should include:
+
+- seed
+- full command line
+- PHP binary path
+- Relay INI values
+- Redis endpoint
+- worker PIDs
+- killed PIDs
+- last N requests
+- last N mutations
+- last N stale observations
+- server stdout/stderr tail
+- Redis values for failing keys
+
+
+Signal strategy
+---------------
+
+The fuzzer should support a configurable signal mix.
+
+Default mix:
+
+- 60% SIGTERM
+- 20% SIGINT
+- 20% SIGKILL
+
+SIGTERM is especially important because PHP and extensions may run shutdown
+logic. SIGKILL is still useful because key lease invalidation should not depend
+on cooperative cleanup.
+
+
+Concurrency model
+-----------------
+
+Start simple:
+
+- One driver process/event loop.
+- Many HTTP requests, optionally concurrent.
+- Redis mutations performed directly by the driver.
+
+Later extension:
+
+- Multiple request pump coroutines.
+- One mutator coroutine.
+- One killer coroutine.
+- One verifier coroutine.
+
+The first implementation can be synchronous with randomized interleaving. That
+is likely enough to shake out persistent stale-cache bugs.
+
+
+Suggested driver phases
+-----------------------
+
+Phase 1: deterministic smoke
+
+- workers=2
+- keys-per-worker=4
+- warm all keys
+- mutate all keys
+- kill one worker with SIGTERM
+- verify no persistent stale values
+
+Phase 2: randomized worker death
+
+- workers=random 1..N
+- mutate random key subset
+- kill random worker subset
+- verify
+
+Phase 3: capacity pressure
+
+Run with combinations where workers exceed writer/cache capacity:
+
+- PHP_CLI_SERVER_WORKERS > relay.max_db_writers
+- PHP_CLI_SERVER_WORKERS > relay.max_endpoint_dbs
+- both equal
+- both smaller than workers
+- both larger than workers
+
+The expected behavior is still no persistent stale value. Some keys may simply
+not be tracked/cached.
+
+Phase 4: crash-style death
+
+- Include SIGKILL.
+- Kill workers immediately after warmup.
+- Kill workers during verification.
+- Kill workers in tight loops while mutating Redis.
+
+
+Failure minimization
+--------------------
+
+On failure, write a reproducer JSON file:
+
+{
+  "seed": 123,
+  "php": "/path/to/php",
+  "redis": {"host": "127.0.0.1", "port": 6379, "db": 0},
+  "workers": 4,
+  "relay_ini": {
+    "relay.max_endpoint_dbs": 1,
+    "relay.max_db_writers": 1
+  },
+  "events": [
+    {"type": "discover", "pid": 1234},
+    {"type": "set", "key": "...", "value": "0"},
+    {"type": "warm", "pid": 1234, "key": "...", "tracked": true},
+    {"type": "incr", "key": "...", "value": "1"},
+    {"type": "kill", "pid": 1234, "signal": "SIGTERM"},
+    {"type": "get", "pid": 1235, "key": "...", "value": "0",
+     "expected": "1", "tracked": true}
+  ]
+}
+
+The harness should be able to replay this event stream as closely as possible.
+
+
+Open questions / later improvements
+-----------------------------------
+
+- Test with php-fpm after the CLI-server version is stable.
+- Add support for running under valgrind, rr, or ASAN builds.
+- Add a mode that sends SIGTERM to the CLI server parent, not just workers.
+- Add endpoint variants that do request shutdown after touching many keys.
+- Add long-running endpoint that warms keys and sleeps, so the driver can kill
+  a worker while it is inside request handling.
+- Add endpoint that calls exit after warming keys, to exercise PHP shutdown
+  without an external signal.
+- Add endpoint that triggers fatal error after warming keys.
+- Add endpoint that allocates many tracked keys before death.
+- Add optional mixed key types later, but string keys are enough for the first
+  invalidation fuzzer.
+
+
+Initial success criterion
+-------------------------
+
+The fuzzer should be able to run for many minutes with:
+
+- no stuck CLI-server workers
+- no stuck requests
+- no persistent stale values
+- no unexpected parent server death
+- useful reproduction logs for any failure
+
+The first version should optimize for observability and deterministic replay
+over raw fuzzing throughput.
