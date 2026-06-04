@@ -1,0 +1,26 @@
+#!/usr/bin/env php
+<?php
+
+declare(strict_types=1);
+
+use MichaelGrunder\RelayCacheFuzzer\Config;
+use MichaelGrunder\RelayCacheFuzzer\Fuzzer;
+use MichaelGrunder\RelayCacheFuzzer\ReplayRunner;
+
+require dirname(__DIR__) . '/vendor/autoload.php';
+require dirname(__DIR__) . '/src/Fuzzer.php';
+
+try {
+    $config = Config::fromArgv($argv);
+
+    if ($config->replayFile !== null) {
+        $runner = new ReplayRunner($config);
+        $runner->run();
+    } else {
+        $fuzzer = new Fuzzer($config);
+        $fuzzer->run();
+    }
+} catch (Throwable $e) {
+    fwrite(STDERR, $e->getMessage() . PHP_EOL);
+    exit(1);
+}
