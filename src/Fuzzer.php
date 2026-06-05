@@ -1321,7 +1321,8 @@ final class Fuzzer
 
         foreach ($keys as $key) {
             $expected = (string) $this->expected[$key];
-            $lastMismatch = null;
+            $lastValueMismatch = null;
+            $lastRequestFailure = null;
 
             for ($attempt = 1; $attempt <= $this->config->verifyRetries; $attempt++) {
                 $this->logger->debug('doing verification read', [
@@ -1332,7 +1333,7 @@ final class Fuzzer
                 $response = $this->tryRequest('/get?key=' . rawurlencode($key));
 
                 if ($response === null) {
-                    $lastMismatch = ['type' => 'request_failed', 'attempt' => $attempt];
+                    $lastRequestFailure = ['type' => 'request_failed', 'attempt' => $attempt];
                     $this->logger->debug('verification read failed; retrying', ['key' => $key, 'attempt' => $attempt]);
                     $this->delayBetweenVerifyAttempts();
                     continue;
@@ -1360,11 +1361,12 @@ final class Fuzzer
                         'value' => $value,
                         'attempt' => $attempt,
                     ]);
-                    $lastMismatch = null;
+                    $lastValueMismatch = null;
+                    $lastRequestFailure = null;
                     break;
                 }
 
-                $lastMismatch = $event;
+                $lastValueMismatch = $event;
                 $this->logger->warning('verification read mismatch', [
                     'key' => $key,
                     'pid' => $pid,
@@ -1388,19 +1390,42 @@ final class Fuzzer
                 $this->delayBetweenVerifyAttempts();
             }
 
-            if ($lastMismatch !== null) {
+            if ($lastValueMismatch !== null) {
                 $this->stats['persistent_stale_failures']++;
                 $redisValue = $this->redis->get($key);
+                $context = [
+                    'key' => $key,
+                    'expected' => $expected,
+                    'redis_value' => $redisValue,
+                    'last_mismatch' => $lastValueMismatch,
+                    'owner_pid' => $this->keyOwner[$key] ?? null,
+                    'owner_pid_killed' => isset($this->killedPids[$this->keyOwner[$key] ?? 0]),
+                ];
+
+                if ($lastRequestFailure !== null) {
+                    $context['last_request_failure'] = $lastRequestFailure;
+                }
+
                 $this->logger->error('persistent mismatch after verification retries', [
                     'key' => $key,
                     'expected' => $expected,
                     'redis_value' => $redisValue,
                 ]);
-                $this->abort('Persistent stale or mismatched value', [
+                $this->abort('Persistent stale or mismatched value', $context);
+            }
+
+            if ($lastRequestFailure !== null) {
+                $redisValue = $this->redis->get($key);
+                $this->logger->error('verification request failed after retries', [
                     'key' => $key,
                     'expected' => $expected,
                     'redis_value' => $redisValue,
-                    'last_mismatch' => $lastMismatch,
+                ]);
+                $this->abort('Verification request failed after retries', [
+                    'key' => $key,
+                    'expected' => $expected,
+                    'redis_value' => $redisValue,
+                    'last_request_failure' => $lastRequestFailure,
                     'owner_pid' => $this->keyOwner[$key] ?? null,
                     'owner_pid_killed' => isset($this->killedPids[$this->keyOwner[$key] ?? 0]),
                 ]);
@@ -2067,14 +2092,15 @@ final class SequentialFuzzer
         $expected = (string) $this->expected[$key];
         $survivorCount = max(1, count($survivors));
         $maxAttempts = max($this->config->verifyRetries, $this->config->verifyRetries * $survivorCount);
-        $lastMismatch = null;
+        $lastValueMismatch = null;
+        $lastRequestFailure = null;
         $seen = [];
 
         for ($attempt = 1; $attempt <= $maxAttempts; $attempt++) {
             $response = $this->tryRequest('/get?key=' . rawurlencode($key));
 
             if ($response === null) {
-                $lastMismatch = ['type' => 'request_failed', 'attempt' => $attempt];
+                $lastRequestFailure = ['type' => 'request_failed', 'attempt' => $attempt];
                 $this->verifyDelay();
                 continue;
             }
@@ -2106,7 +2132,8 @@ final class SequentialFuzzer
                     $seen[$pid] = true;
                 }
 
-                $lastMismatch = null;
+                $lastValueMismatch = null;
+                $lastRequestFailure = null;
 
                 if (count($seen) >= count($survivors)) {
                     return;
@@ -2115,7 +2142,7 @@ final class SequentialFuzzer
                 continue;
             }
 
-            $lastMismatch = $event;
+            $lastValueMismatch = $event;
 
             if ($value !== null && ctype_digit($value) && (int) $value < (int) $expected) {
                 $this->stats['stale_observations']++;
@@ -2126,14 +2153,33 @@ final class SequentialFuzzer
             $this->verifyDelay();
         }
 
-        if ($lastMismatch !== null) {
+        if ($lastValueMismatch !== null) {
             $this->stats['persistent_stale_failures']++;
             $redisValue = $this->redis->get($key);
-            $this->fail('Persistent stale or mismatched value in sequential mode', [
+            $context = [
                 'key' => $key,
                 'expected' => $expected,
                 'redis_value' => $redisValue,
-                'last_mismatch' => $lastMismatch,
+                'last_mismatch' => $lastValueMismatch,
+                'owner_pid' => $this->keyOwner[$key] ?? null,
+                'owner_pid_killed' => isset($this->killedPids[$this->keyOwner[$key] ?? 0]),
+                'survivors' => array_keys($survivors),
+            ];
+
+            if ($lastRequestFailure !== null) {
+                $context['last_request_failure'] = $lastRequestFailure;
+            }
+
+            $this->fail('Persistent stale or mismatched value in sequential mode', $context);
+        }
+
+        if ($lastRequestFailure !== null) {
+            $redisValue = $this->redis->get($key);
+            $this->fail('Verification request failed after retries in sequential mode', [
+                'key' => $key,
+                'expected' => $expected,
+                'redis_value' => $redisValue,
+                'last_request_failure' => $lastRequestFailure,
                 'owner_pid' => $this->keyOwner[$key] ?? null,
                 'owner_pid_killed' => isset($this->killedPids[$this->keyOwner[$key] ?? 0]),
                 'survivors' => array_keys($survivors),
@@ -2959,14 +3005,15 @@ final class SimpleSequentialFuzzer
     private function verifyKey(string $key): int
     {
         $expected = (string) $this->expected[$key];
-        $lastMismatch = null;
+        $lastValueMismatch = null;
+        $lastRequestFailure = null;
         $stale = 0;
 
         for ($attempt = 1; $attempt <= $this->config->verifyRetries; $attempt++) {
             $response = $this->tryRequest('/get?key=' . rawurlencode($key));
 
             if ($response === null) {
-                $lastMismatch = ['type' => 'request_failed', 'attempt' => $attempt];
+                $lastRequestFailure = ['type' => 'request_failed', 'attempt' => $attempt];
                 $this->verifyDelay();
                 continue;
             }
@@ -2993,25 +3040,44 @@ final class SimpleSequentialFuzzer
             }
 
             $stale++;
-            $lastMismatch = $event;
+            $lastValueMismatch = $event;
             $this->stats['stale_observations']++;
             $this->staleObservations[] = $event;
             $this->logLine('STALE', $event, 'warning');
             $this->verifyDelay();
         }
 
-        if ($lastMismatch !== null) {
+        if ($lastValueMismatch !== null) {
             $this->stats['persistent_stale_failures']++;
             $redisValue = $this->redis->get($key);
-            $this->fail('Persistent stale or mismatched value in simple sequential mode', [
+            $context = [
                 'key' => $key,
                 'expected' => $expected,
-                'actual' => $lastMismatch['value'] ?? null,
+                'actual' => $lastValueMismatch['value'] ?? null,
                 'redis_value' => $redisValue,
                 'worker_count' => count($this->aliveWorkers),
                 'last_mutation' => $this->lastMutation,
                 'last_killed_worker' => $this->lastKilledWorker,
-                'last_mismatch' => $lastMismatch,
+                'last_mismatch' => $lastValueMismatch,
+            ];
+
+            if ($lastRequestFailure !== null) {
+                $context['last_request_failure'] = $lastRequestFailure;
+            }
+
+            $this->fail('Persistent stale or mismatched value in simple sequential mode', $context);
+        }
+
+        if ($lastRequestFailure !== null) {
+            $redisValue = $this->redis->get($key);
+            $this->fail('Verification request failed after retries in simple sequential mode', [
+                'key' => $key,
+                'expected' => $expected,
+                'redis_value' => $redisValue,
+                'worker_count' => count($this->aliveWorkers),
+                'last_mutation' => $this->lastMutation,
+                'last_killed_worker' => $this->lastKilledWorker,
+                'last_request_failure' => $lastRequestFailure,
             ]);
         }
 
