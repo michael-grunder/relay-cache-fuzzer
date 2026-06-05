@@ -147,10 +147,10 @@ bin/relay-cache-fuzzer --help
 
 ## Failures And Diagnostics
 
-On failure, the fuzzer writes a JSON reproducer file named like:
+On randomized-mode failure, the fuzzer writes a JSON reproducer file named like:
 
 ```text
-relay-cache-fuzzer-failure-{run_id}-{timestamp}.json
+reproducers/random/00001/reproducer.json
 ```
 
 The file includes:
@@ -173,7 +173,7 @@ and server output.
 Sequential-mode failures write a reproducer directory named like:
 
 ```text
-relay-cache-fuzzer-sequential-failure-{run_id}-{timestamp}/
+reproducers/sequential/00001/
 ```
 
 The bundle contains `startup.json`, `reproducer.json`, `events.log`,
@@ -186,7 +186,7 @@ Replay an event stream with:
 ```bash
 bin/relay-cache-fuzzer \
   --php=/home/mike/dev/phpfarm/src/php-8.5.0-debug/sapi/cli/php \
-  --replay=relay-cache-fuzzer-failure-...json
+  --replay=reproducers/random/00001/reproducer.json
 ```
 
 Replay is best-effort because PHP CLI-server worker scheduling and operating

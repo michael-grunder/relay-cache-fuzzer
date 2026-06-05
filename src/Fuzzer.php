@@ -30,6 +30,34 @@ final class RequestException extends RuntimeException
     }
 }
 
+final class ReproducerPaths
+{
+    public static function createBundleDirectory(string $mode): string
+    {
+        $root = getcwd() . DIRECTORY_SEPARATOR . 'reproducers' . DIRECTORY_SEPARATOR . $mode;
+
+        if (!is_dir($root) && !mkdir($root, 0777, true) && !is_dir($root)) {
+            throw new FuzzerException("Could not create reproducer root {$root}");
+        }
+
+        for ($i = 1; $i <= 99999; $i++) {
+            $path = $root . DIRECTORY_SEPARATOR . sprintf('%05d', $i);
+
+            if (@mkdir($path)) {
+                return $path;
+            }
+
+            if (is_dir($path)) {
+                continue;
+            }
+
+            throw new FuzzerException("Could not create reproducer bundle {$path}");
+        }
+
+        throw new FuzzerException("Could not allocate reproducer bundle under {$root}");
+    }
+}
+
 final class HumanLogFormatter implements FormatterInterface
 {
     public function __construct(private readonly bool $decorated)
@@ -1261,7 +1289,8 @@ final class Fuzzer
     private function writeReproducer(string $reason, array $context): string
     {
         $this->server->drain();
-        $path = getcwd() . '/relay-cache-fuzzer-failure-' . $this->runId . '-' . date('Ymd-His') . '.json';
+        $bundlePath = ReproducerPaths::createBundleDirectory('random');
+        $path = $bundlePath . DIRECTORY_SEPARATOR . 'reproducer.json';
         $payload = [
             'reason' => $reason,
             'context' => $context,
@@ -2004,11 +2033,7 @@ final class SequentialFuzzer
     {
         $this->server->drain();
 
-        $path = getcwd() . '/relay-cache-fuzzer-sequential-failure-' . $this->runId . '-' . date('Ymd-His');
-
-        if (!mkdir($path, 0777, true) && !is_dir($path)) {
-            throw new FuzzerException("Could not create reproducer bundle {$path}", previous: $throwable);
-        }
+        $path = ReproducerPaths::createBundleDirectory('sequential');
 
         $commandLine = $this->server->commandLine();
         $output = $this->server->outputText();
