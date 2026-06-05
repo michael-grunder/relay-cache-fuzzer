@@ -1,0 +1,439 @@
+Harness Coordinator
+===================
+
+Overview
+--------
+
+Add a top-level harness coordinator:
+
+    bin/harness
+
+The harness is responsible for:
+
+1. Launching many relay-cache-fuzzer instances in parallel.
+2. Tracking aggregate fuzzing progress.
+3. Collecting failures.
+4. Optionally performing testcase reduction.
+5. Presenting a live TUI dashboard.
+6. Acting as the primary entry point for long-running fuzz campaigns.
+
+The harness should treat relay-cache-fuzzer as an opaque inferior process.
+
+It should not contain fuzzing logic itself.
+
+Instead it schedules, monitors, and coordinates independent fuzzer jobs.
+
+
+Invocation
+----------
+
+The harness should separate its own arguments from inferior arguments:
+
+    bin/harness [HARNESS OPTIONS] -- [FUZZER OPTIONS]
+
+Examples:
+
+    bin/harness \
+        --jobs=16 \
+        -- \
+        bin/relay-cache-fuzzer \
+            --mode=simple-sequential \
+            --workers=8
+
+    bin/harness \
+        --jobs=32 \
+        --reduce \
+        -- \
+        bin/relay-cache-fuzzer \
+            --mode=normal \
+            --commands-per-worker={{COMMANDS}}
+
+Everything after "--" is considered part of the inferior command.
+
+
+Goals
+-----
+
+The harness is intended for:
+
+- Multi-core fuzzing campaigns.
+- Overnight fuzzing.
+- Continuous fuzzing.
+- Automatic reproduction collection.
+- Automatic testcase reduction.
+- Long-term statistics gathering.
+
+The harness should assume failures are rare and expensive.
+
+Maximizing the number of independent fuzz runs is generally more valuable than
+maximizing the speed of any individual run.
+
+
+Core Options
+------------
+
+    --jobs=N
+
+        Number of inferiors to run simultaneously.
+
+        Default:
+            number of logical CPUs
+
+    --reduce
+
+        Enable automatic testcase reduction.
+
+        When a flaw is discovered, attempt to minimize selected parameters
+        before reporting the final reproducer.
+
+    --work-dir=PATH
+
+        Root directory for harness state.
+
+    --keep-going
+
+        Continue fuzzing after failures.
+
+        Default behavior should be to continue.
+
+    --stop-on-first
+
+        Stop all jobs after the first confirmed flaw.
+
+    --tui
+
+        Enable fullscreen dashboard.
+
+    --no-tui
+
+        Plain logging mode.
+
+    --stats-interval=N
+
+        Dashboard refresh interval.
+
+    --seed=N
+
+        Harness RNG seed.
+
+
+Job Model
+---------
+
+Each running inferior is represented by:
+
+    Job {
+        id
+        start_time
+        state
+        command
+        seed
+        pid
+        run_count
+        failures
+        current_reduction_state
+    }
+
+Jobs are independent.
+
+A worker failure should never terminate the harness.
+
+The harness simply records the failure and starts a replacement job.
+
+
+Template Substitution
+---------------------
+
+The harness should support template variables inside inferior arguments.
+
+Example:
+
+    --commands-per-worker={{COMMANDS}}
+
+Before spawning an inferior, the harness replaces placeholders with the
+current reduction values.
+
+Examples:
+
+    {{COMMANDS}}
+    {{WORKERS}}
+    {{KEYS}}
+    {{MUTATIONS}}
+    {{VERIFY_RETRIES}}
+
+Initial values come from the inferior command line.
+
+Reduction logic may later modify them.
+
+This mechanism should remain generic so additional variables can be added
+without modifying the core harness architecture.
+
+
+Failure Detection
+-----------------
+
+Inferiors should exit with a distinct status when a flaw is found.
+
+For example:
+
+    0 = normal completion
+    1 = infrastructure error
+    2 = flaw detected
+
+The exact values do not matter as long as they are documented.
+
+When a flaw is detected:
+
+1. Record the failure.
+2. Capture reproducer location.
+3. Record command line.
+4. Record reduction state.
+5. Optionally start reduction.
+6. Display prominently in the dashboard.
+
+
+Reduction Mode
+--------------
+
+Reduction should be intentionally simple initially.
+
+The first implementation only needs to support integer parameter reduction.
+
+Example:
+
+    --commands-per-worker={{COMMANDS}}
+
+Initial value:
+
+    10000
+
+Failure occurs.
+
+Harness attempts:
+
+    5000
+    2500
+    1250
+    625
+
+and so on.
+
+The objective is to find the smallest value that still reproduces the flaw.
+
+The reduction algorithm can be improved later.
+
+Initially something similar to binary reduction or ratcheting reduction is
+sufficient.
+
+Example strategy:
+
+    while reproduces:
+        value /= 2
+
+    then walk upward to find minimum stable reproducer
+
+The reduction framework should be generic enough to support:
+
+    COMMANDS
+    WORKERS
+    KEYS
+    MUTATIONS
+    VERIFY_RETRIES
+
+or any future integer parameter.
+
+
+Unique Keyspace Isolation
+-------------------------
+
+Multiple inferiors will be running simultaneously.
+
+Key names must never collide.
+
+The harness should provide a unique run identifier to every inferior.
+
+Example:
+
+    --run-id=harness-job-17-run-392
+
+Inferiors incorporate this value into all Redis keys.
+
+Example:
+
+    relay-fuzz:harness-job-17-run-392:key:0
+
+This guarantees:
+
+- No key collisions.
+- No accidental invalidation sharing.
+- No interference between jobs.
+
+Every inferior run should have a globally unique identifier.
+
+
+Artifact Collection
+-------------------
+
+The harness should maintain a directory structure like:
+
+    artifacts/
+        failures/
+            000001/
+            000002/
+            000003/
+
+Each failure directory contains:
+
+    reproducer bundle
+    reduction results
+    command line
+    metadata
+
+Metadata should include:
+
+    timestamp
+    harness seed
+    inferior seed
+    job id
+    reduction parameters
+    reproducer location
+
+This allows failures to be revisited long after the original run.
+
+
+Dashboard
+---------
+
+The harness should provide a fullscreen dashboard.
+
+php-tui is a good fit.
+
+The dashboard should update continuously and provide at least:
+
+Top Summary
+------------
+
+    Elapsed Time
+    Active Jobs
+    Total Runs
+    Total Failures
+    Runs / Hour
+    Failures / Hour
+
+Failure Summary
+---------------
+
+    Last Failure Time
+    Last Failure Job
+    Last Failure Path
+    Total Reproducers
+
+Reduction Summary
+-----------------
+
+    Active Reductions
+    Completed Reductions
+
+Current Reduction Values
+------------------------
+
+    COMMANDS
+    WORKERS
+    KEYS
+    MUTATIONS
+    VERIFY_RETRIES
+
+Job Table
+---------
+
+    Job ID
+    PID
+    State
+    Runtime
+    Seed
+    Runs
+    Failures
+
+Recent Events
+-------------
+
+    Job started
+    Job completed
+    Failure detected
+    Reduction started
+    Reduction completed
+
+The dashboard should remain useful even when running hundreds of thousands of
+iterations over many hours.
+
+
+Long Running Campaigns
+----------------------
+
+The harness should be designed with the assumption that it may run for:
+
+    hours
+    days
+    weeks
+
+Statistics should therefore be cumulative.
+
+Periodic snapshots may be useful later but are not required initially.
+
+
+Architecture
+------------
+
+bin/harness
+    |
+    +-- Scheduler
+    |
+    +-- Job Manager
+    |
+    +-- Reduction Manager
+    |
+    +-- Artifact Manager
+    |
+    +-- Dashboard
+    |
+    +-- Inferior Processes
+            |
+            +-- relay-cache-fuzzer
+            +-- relay-cache-fuzzer
+            +-- relay-cache-fuzzer
+            +-- ...
+
+The relay-cache-fuzzer remains responsible for:
+
+    cache fuzzing
+    reproducer generation
+    rr integration
+    failure determination
+
+The harness remains responsible for:
+
+    scheduling
+    parallelism
+    reduction
+    aggregation
+    visualization
+
+
+Future Enhancements
+-------------------
+
+Not required for the initial implementation:
+
+- Distributed fuzzing across multiple hosts.
+- Historical failure database.
+- Automatic rr replay verification.
+- Coverage-guided scheduling.
+- Failure deduplication.
+- Corpus management.
+- Parameter-space exploration.
+- Automated bisection of Relay commits.
+
+The initial goal is simply:
+
+    "Run many fuzzers in parallel, collect failures, reduce them, and provide
+    a clear real-time view of what the campaign is doing."
