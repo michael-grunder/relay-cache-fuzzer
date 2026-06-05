@@ -1,0 +1,368 @@
+Simple Sequential Mutation Mode
+===============================
+
+Overview
+--------
+
+Add a simplified sequential fuzzing mode focused entirely on detecting stale
+cache entries after worker termination.
+
+Unlike the worker-key ownership mode, this mode does not attempt to determine
+which worker cached which key. We simply populate a shared keyspace, mutate it,
+kill workers, and continuously verify that Relay never serves stale data for an
+extended period.
+
+This mode is intended to be:
+
+- Simple
+- Easy to reason about
+- Easy to debug
+- Easy to replay under rr
+
+If a failure occurs, rr replay should provide enough information to determine
+exactly why a stale value survived.
+
+
+Goals
+-----
+
+The purpose of this mode is to answer a single question:
+
+    Can Relay continue serving stale values after keys have been mutated and
+    workers have exited?
+
+We do not care:
+
+- Which worker cached a key.
+- Whether every worker cached every key.
+- Which worker serves a verification request.
+
+We only care whether stale data survives.
+
+
+Keyspace Initialization
+-----------------------
+
+Before starting:
+
+1. FLUSHDB.
+2. Create a deterministic keyspace.
+
+Example:
+
+    key:0
+    key:1
+    key:2
+    ...
+    key:N-1
+
+Initial value:
+
+    1
+
+The coordinator maintains the authoritative expected value for every key.
+
+Example:
+
+    expected["key:0"] = 1
+    expected["key:1"] = 1
+    ...
+
+This state is updated whenever mutations occur.
+
+
+Worker Startup
+--------------
+
+1. Start the PHP CLI server.
+2. Configure PHP_CLI_SERVER_WORKERS as requested.
+3. Discover worker PIDs.
+4. Record all observed workers.
+
+No worker-to-key assignment is required.
+
+
+Warmup Phase
+------------
+
+Warm the cache by consuming the entire keyspace.
+
+For each key:
+
+    GET key
+
+through the HTTP endpoint.
+
+We do not attempt to route requests to specific workers.
+
+We simply issue requests and allow the operating system and CLI server to
+distribute them naturally.
+
+The goal is only to ensure the keyspace has been touched and is likely cached.
+
+
+Sequential Loop
+---------------
+
+Once warmup is complete:
+
+    alive_workers = discovered_workers
+
+Loop until no workers remain.
+
+Each iteration performs:
+
+1. Select a worker.
+2. Kill the worker.
+3. Wait for termination.
+4. Perform one or more random mutations.
+5. Verify the entire keyspace.
+6. Log results.
+
+Repeat.
+
+
+Worker Termination
+------------------
+
+Worker selection may initially be random.
+
+Supported signals should be configurable.
+
+Default signal set:
+
+    SIGINT
+    SIGTERM
+    SIGQUIT
+
+A signal is randomly selected from the configured set for each worker
+termination.
+
+Future extensions may include:
+
+    SIGKILL
+    SIGABRT
+
+but they should not be enabled by default.
+
+
+Mutation Phase
+--------------
+
+After each worker death, perform a configurable number of mutations.
+
+Command line option:
+
+    --mutations=N
+
+Each mutation is selected randomly.
+
+Initially supported mutations:
+
+    INCRBY key amount
+
+and
+
+    FLUSHDB
+
+INCRBY
+------
+
+Select a random key:
+
+    key:X
+
+Select a random increment:
+
+    1..M
+
+Perform:
+
+    INCRBY key:X increment
+
+Update:
+
+    expected[key:X]
+
+accordingly.
+
+
+FLUSHDB
+-------
+
+Occasionally perform:
+
+    FLUSHDB
+
+When this occurs:
+
+    expected[key] = null
+
+for all keys.
+
+The keyspace may then be rebuilt or left empty depending on the desired
+behavior.
+
+Initially rebuilding the keyspace immediately after FLUSHDB is probably the
+simplest approach.
+
+
+Verification Phase
+------------------
+
+After mutations complete:
+
+1. Read every key through Relay.
+2. Compare against expected values.
+
+Expected values may come from either:
+
+- The coordinator's internal state.
+- A direct Redis connection that bypasses Relay.
+
+Both approaches are acceptable.
+
+The important thing is that Relay is not the source of truth.
+
+
+Failure Detection
+-----------------
+
+A stale observation occurs when:
+
+    relay_value != expected_value
+
+Examples:
+
+Expected:
+
+    key:42 = 9
+
+Relay returns:
+
+    key:42 = 8
+
+This is stale.
+
+Transient stale observations may be retried.
+
+Persistent stale observations should fail the run.
+
+Failure records should include:
+
+    key
+    expected value
+    actual value
+    worker count
+    last mutation
+    last killed worker
+    signal used
+
+
+Rich Logging
+------------
+
+This mode should be extremely verbose.
+
+Example:
+
+    [START] workers=8 keys=100 mutations=5
+
+    [WARMUP] consumed keyspace
+
+    [KILL] pid=12345 signal=SIGTERM
+
+    [MUTATE] INCRBY key:17 3
+    [MUTATE] INCRBY key:91 1
+    [MUTATE] INCRBY key:5 4
+
+    [VERIFY] scanned 100 keys
+    [VERIFY] stale=0
+
+    [KILL] pid=12349 signal=SIGINT
+
+    [MUTATE] FLUSHDB
+
+    [VERIFY] scanned 100 keys
+    [VERIFY] stale=0
+
+    [OK] 6 workers remaining
+
+The intent is that someone watching the console can immediately understand
+exactly what is happening.
+
+
+Command Line Options
+--------------------
+
+New options:
+
+    --keys=N
+
+        Total keyspace size.
+
+    --mutations=N
+
+        Number of mutations performed after each worker death.
+
+    --signals=SIGINT,SIGTERM,SIGQUIT
+
+        Comma-separated list of signals that may be used when terminating
+        workers.
+
+Existing options should continue to work unchanged, including:
+
+    --rr
+    --delay-us
+    --seed
+    --php
+    --workers
+
+
+RR Integration
+--------------
+
+This mode is specifically intended to work well with rr.
+
+When a stale value is detected:
+
+1. Stop fuzzing.
+2. Preserve rr trace.
+3. Wait for rr trace finalization.
+4. Generate reproducer bundle.
+5. Report trace location.
+
+The reproducer should contain:
+
+    startup.json
+    reproducer.json
+    events.log
+    server.stdout
+    server.stderr
+    rr/
+
+Because this mode uses a deterministic sequence of:
+
+    kill worker
+    mutate keys
+    verify keyspace
+
+it should be significantly easier to debug than the worker-key ownership mode.
+
+
+Rationale
+---------
+
+The more complicated worker-assignment approach is useful when investigating
+specific ownership and invalidation behaviors.
+
+However, for initial stale-cache detection, it introduces unnecessary
+complexity.
+
+This simplified mode focuses entirely on the observable property that matters:
+
+    After keys change and workers disappear, does Relay ever continue serving
+    old values?
+
+If the answer is yes, rr replay can then be used to investigate the precise
+internal cause.
