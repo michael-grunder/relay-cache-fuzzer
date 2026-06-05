@@ -4,6 +4,24 @@ declare(strict_types=1);
 
 namespace MichaelGrunder\RelayCacheFuzzer\Harness;
 
+use PhpTui\Tui\Color\AnsiColor;
+use PhpTui\Tui\Display\Display;
+use PhpTui\Tui\DisplayBuilder;
+use PhpTui\Tui\Extension\Core\Widget\Block\Padding;
+use PhpTui\Tui\Extension\Core\Widget\BlockWidget;
+use PhpTui\Tui\Extension\Core\Widget\GridWidget;
+use PhpTui\Tui\Extension\Core\Widget\Paragraph\Wrap;
+use PhpTui\Tui\Extension\Core\Widget\ParagraphWidget;
+use PhpTui\Tui\Extension\Core\Widget\Table\TableRow;
+use PhpTui\Tui\Extension\Core\Widget\TableWidget;
+use PhpTui\Tui\Layout\Constraint;
+use PhpTui\Tui\Style\Modifier;
+use PhpTui\Tui\Style\Style;
+use PhpTui\Tui\Text\Title;
+use PhpTui\Tui\Widget\BorderType;
+use PhpTui\Tui\Widget\Borders;
+use PhpTui\Tui\Widget\Direction;
+use PhpTui\Tui\Widget\Widget;
 use RuntimeException;
 use Random\Engine\Mt19937;
 use Random\Randomizer;
@@ -878,6 +896,8 @@ final class ReductionManager
 
 final class Dashboard
 {
+    private ?Display $display = null;
+
     public function __construct(private readonly HarnessConfig $config)
     {
     }
@@ -891,90 +911,238 @@ final class Dashboard
             return;
         }
 
+        if (!$this->display instanceof Display) {
+            $this->enter();
+        }
+
+        if (!$this->display instanceof Display) {
+            return;
+        }
+
         $elapsed = max(0.001, microtime(true) - $stats->startedAt);
         $hours = $elapsed / 3600;
         $activeJobs = count(array_filter($jobs, static fn (Job $job): bool => $job->state === 'running'));
-        $lines = [];
-        $lines[] = "\033[H\033[2JRelay Cache Fuzzer Harness";
-        $lines[] = 'Elapsed: ' . self::duration($elapsed)
-            . '  Active Jobs: ' . $activeJobs . '/' . count($jobs)
-            . '  Runs: ' . number_format($stats->totalRuns)
-            . '  Failures: ' . number_format($stats->totalFailures)
-            . '  Runs/Hour: ' . number_format($stats->totalRuns / $hours, 1)
-            . '  Failures/Hour: ' . number_format($stats->totalFailures / $hours, 2);
-        $lines[] = '';
-        $lines[] = 'Failure Summary';
-        $lines[] = 'Last Failure Time: ' . ($stats->lastFailureAt === null ? 'none' : date('Y-m-d H:i:s', (int) $stats->lastFailureAt))
-            . '  Job: ' . ($stats->lastFailureJob === null ? 'none' : (string) $stats->lastFailureJob)
-            . '  Total Reproducers: ' . number_format($stats->totalReproducers);
-        $lines[] = 'Last Failure Path: ' . ($stats->lastFailurePath ?? 'none');
-        $lines[] = '';
-        $lines[] = 'Reduction Summary';
-        $lines[] = 'Active Reductions: ' . $reductions->activeCount() . '  Completed Reductions: ' . number_format($stats->completedReductions);
 
-        foreach ($reductions->activeTasks() as $task) {
-            $lines[] = sprintf(
-                '  #%d %s low=%d high=%d best=%d attempt=%s',
-                $task->id,
-                $task->activeVariable ?? 'none',
-                $task->low,
-                $task->high,
-                $task->best,
-                $task->attemptValue === null ? 'none' : (string) $task->attemptValue,
-            );
-        }
-
-        $lines[] = '';
-        $lines[] = 'Current Reduction Values';
-        $interesting = ['COMMANDS', 'WORKERS', 'KEYS', 'MUTATIONS', 'VERIFY_RETRIES'];
-        $parts = [];
-
-        $all = $values->all();
-
-        foreach ($interesting as $name) {
-            $parts[] = $name . '=' . ($all[$name] ?? 'n/a');
-        }
-
-        $lines[] = implode('  ', $parts);
-        $lines[] = '';
-        $lines[] = sprintf('%-6s %-8s %-12s %-10s %-12s %-8s %-8s', 'Job', 'PID', 'State', 'Runtime', 'Seed', 'Runs', 'Fails');
-
-        foreach ($jobs as $job) {
-            $runtime = $job->startTime === null ? '-' : self::duration(microtime(true) - $job->startTime);
-            $lines[] = sprintf(
-                '%-6d %-8s %-12s %-10s %-12d %-8d %-8d',
-                $job->id,
-                $job->pid === null ? '-' : (string) $job->pid,
-                $job->state,
-                $runtime,
-                $job->seed,
-                $job->runCount,
-                $job->failures,
-            );
-        }
-
-        $lines[] = '';
-        $lines[] = 'Recent Events';
-
-        foreach (array_slice($events->all(), -12) as $event) {
-            $lines[] = $event;
-        }
-
-        fwrite(STDOUT, implode("\n", $lines) . "\n");
+        $this->display->draw(
+            GridWidget::default()
+                ->direction(Direction::Vertical)
+                ->constraints(
+                    Constraint::length(6),
+                    Constraint::length(7),
+                    Constraint::min(8),
+                    Constraint::length(8),
+                )
+                ->widgets(
+                    $this->summaryPanel($elapsed, $hours, $activeJobs, count($jobs), $stats),
+                    GridWidget::default()
+                        ->direction(Direction::Horizontal)
+                        ->constraints(Constraint::percentage(50), Constraint::percentage(50))
+                        ->widgets(
+                            $this->failurePanel($stats),
+                            $this->knobPanel($values, $reductions),
+                        ),
+                    GridWidget::default()
+                        ->direction(Direction::Horizontal)
+                        ->constraints(Constraint::percentage(58), Constraint::percentage(42))
+                        ->widgets(
+                            $this->jobsPanel($jobs),
+                            $this->reductionsPanel($stats, $reductions),
+                        ),
+                    $this->eventsPanel($events),
+                )
+        );
     }
 
     public function enter(): void
     {
         if ($this->config->tui) {
             fwrite(STDOUT, "\033[?25l");
+            $this->display ??= DisplayBuilder::default()->fullscreen()->build();
+            $this->display->clear();
         }
     }
 
     public function leave(): void
     {
         if ($this->config->tui) {
+            $this->display?->clear();
             fwrite(STDOUT, "\033[?25h\033[0m\n");
+            $this->display = null;
         }
+    }
+
+    private function summaryPanel(float $elapsed, float $hours, int $activeJobs, int $jobCount, CampaignStats $stats): Widget
+    {
+        return $this->panel('Relay Cache Fuzzer Harness', $this->spacedTable(TableWidget::default()
+            ->widths(Constraint::percentage(23), Constraint::percentage(23), Constraint::percentage(23), Constraint::percentage(23))
+            ->rows(
+                TableRow::fromStrings('elapsed', 'runs done', 'reproducers', 'active jobs'),
+                TableRow::fromStrings(
+                    self::duration($elapsed),
+                    number_format($stats->totalRuns),
+                    number_format($stats->totalReproducers),
+                    "{$activeJobs}/{$jobCount}",
+                ),
+                TableRow::fromStrings('runs/hour', 'flaws/hour', 'failures', 'completed reductions'),
+                TableRow::fromStrings(
+                    number_format($stats->totalRuns / $hours, 1),
+                    number_format($stats->totalFailures / $hours, 2),
+                    number_format($stats->totalFailures),
+                    number_format($stats->completedReductions),
+                ),
+            )));
+    }
+
+    private function failurePanel(CampaignStats $stats): Widget
+    {
+        return $this->panel('Reproducers', ParagraphWidget::fromString(implode("\n", [
+            'count: ' . number_format($stats->totalReproducers),
+            'last time: ' . ($stats->lastFailureAt === null ? 'none' : date('Y-m-d H:i:s', (int) $stats->lastFailureAt)),
+            'last job: ' . ($stats->lastFailureJob === null ? 'none' : (string) $stats->lastFailureJob),
+            'last reproducer: ' . ($stats->lastFailurePath ?? 'none'),
+        ]))->wrap(Wrap::WordTrimmed));
+    }
+
+    private function knobPanel(TemplateValues $values, ReductionManager $reductions): Widget
+    {
+        $all = $values->all();
+        $rows = [];
+
+        foreach ($this->knobNames($values) as $name) {
+            $rows[] = TableRow::fromStrings($name, isset($all[$name]) ? number_format($all[$name]) : 'n/a', $this->reductionStateFor($name, $reductions));
+        }
+
+        return $this->panel('Current Knobs', $this->spacedTable(TableWidget::default()
+            ->widths(Constraint::percentage(38), Constraint::percentage(18), Constraint::percentage(36))
+            ->header(TableRow::fromStrings('name', 'value', 'reduction'))
+            ->rows(...array_slice($rows, 0, 12))));
+    }
+
+    /**
+     * @param list<Job> $jobs
+     */
+    private function jobsPanel(array $jobs): Widget
+    {
+        $rows = [];
+
+        foreach ($jobs as $job) {
+            $runtime = $job->startTime === null ? '-' : self::duration(microtime(true) - $job->startTime);
+            $rows[] = TableRow::fromStrings(
+                (string) $job->id,
+                $job->pid === null ? '-' : (string) $job->pid,
+                $job->state,
+                $runtime,
+                (string) $job->seed,
+                number_format($job->runCount),
+                number_format($job->failures),
+            );
+        }
+
+        return $this->panel('Inferiors', $this->spacedTable(TableWidget::default()
+            ->widths(
+                Constraint::percentage(7),
+                Constraint::percentage(12),
+                Constraint::percentage(15),
+                Constraint::percentage(15),
+                Constraint::percentage(20),
+                Constraint::percentage(10),
+                Constraint::percentage(10),
+            )
+            ->header(TableRow::fromStrings('job', 'pid', 'state', 'runtime', 'seed', 'runs', 'fails'))
+            ->rows(...$rows)));
+    }
+
+    private function reductionsPanel(CampaignStats $stats, ReductionManager $reductions): Widget
+    {
+        $rows = [
+            TableRow::fromStrings('active', (string) $reductions->activeCount(), 'completed', number_format($stats->completedReductions)),
+            TableRow::fromStrings('pending', (string) $reductions->pendingCount(), '', ''),
+        ];
+
+        foreach ($reductions->activeTasks() as $task) {
+            $rows[] = TableRow::fromStrings(
+                '#' . $task->id,
+                $task->activeVariable ?? 'none',
+                'try ' . ($task->attemptValue === null ? '-' : (string) $task->attemptValue),
+                "best {$task->best} [{$task->low},{$task->high}]",
+            );
+        }
+
+        return $this->panel('Reduction', $this->spacedTable(TableWidget::default()
+            ->widths(Constraint::percentage(18), Constraint::percentage(28), Constraint::percentage(20), Constraint::percentage(28))
+            ->rows(...array_slice($rows, 0, 10))));
+    }
+
+    private function eventsPanel(HarnessEventLog $events): Widget
+    {
+        return $this->panel('Recent Events', ParagraphWidget::fromString(implode("\n", array_slice($events->all(), -6)))->wrap(Wrap::WordTrimmed));
+    }
+
+    private function panel(string $title, Widget $widget): Widget
+    {
+        return BlockWidget::default()
+            ->borders(Borders::ALL)
+            ->borderType(BorderType::Rounded)
+            ->titles(Title::fromString($title))
+            ->titleStyle(Style::default()->fg(AnsiColor::LightCyan)->addModifier(Modifier::BOLD))
+            ->borderStyle(Style::default()->fg(AnsiColor::DarkGray))
+            ->padding(Padding::horizontal(1))
+            ->widget($widget);
+    }
+
+    private function spacedTable(TableWidget $table): TableWidget
+    {
+        $table->columnSpacing = 1;
+
+        return $table;
+    }
+
+    /**
+     * @return list<string>
+     */
+    private function knobNames(TemplateValues $values): array
+    {
+        $names = array_unique([
+            ...$values->reducibleNames(),
+            'COMMANDS',
+            'COMMANDS_PER_WORKER',
+            'WORKERS',
+            'KEYS',
+            'MUTATIONS',
+            'VERIFY_RETRIES',
+        ]);
+        sort($names);
+
+        $values = $values->all();
+
+        return array_values(array_filter($names, static fn (string $name): bool => isset($values[$name])));
+    }
+
+    private function reductionStateFor(string $name, ReductionManager $reductions): string
+    {
+        foreach ($reductions->activeTasks() as $task) {
+            if ($task->activeVariable === $name) {
+                return sprintf('trying %s best %d', $task->attemptValue === null ? '-' : (string) $task->attemptValue, $task->best);
+            }
+        }
+
+        return in_array($name, $this->activeReductionNames($reductions), true) ? 'queued' : '';
+    }
+
+    /**
+     * @return list<string>
+     */
+    private function activeReductionNames(ReductionManager $reductions): array
+    {
+        $names = [];
+
+        foreach ($reductions->activeTasks() as $task) {
+            foreach ($task->variables as $name) {
+                $names[] = $name;
+            }
+        }
+
+        return $names;
     }
 
     private static function duration(float $seconds): string
@@ -1037,7 +1205,7 @@ final class Coordinator
                     $lastRender = $now;
                 }
 
-                if ($this->stopping && !$this->hasRunningJobs() && $this->reductions->activeCount() === 0 && $this->reductions->pendingCount() === 0) {
+                if (($this->stopping || !$this->config->keepGoing) && !$this->hasRunningJobs() && $this->reductions->activeCount() === 0 && $this->reductions->pendingCount() === 0) {
                     break;
                 }
 
