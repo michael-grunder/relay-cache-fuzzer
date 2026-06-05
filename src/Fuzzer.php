@@ -165,6 +165,145 @@ final class LogFactory
     }
 }
 
+final class StartupBlock
+{
+    /**
+     * @param list<array{section: string, setting: string, value: mixed}> $modeRows
+     */
+    public static function write(Config $config, string $runId, array $modeRows = []): void
+    {
+        $rows = array_merge(self::baseRows($config, $runId), $modeRows);
+        $sectionWidth = max(array_map(static fn (array $row): int => strlen($row['section']), $rows));
+        $settingWidth = max(array_map(static fn (array $row): int => strlen($row['setting']), $rows));
+        $valueWidth = max(array_map(static fn (array $row): int => strlen(self::formatValue($row['value'])), $rows));
+        $rule = '+-' . str_repeat('-', $sectionWidth) . '-+-' . str_repeat('-', $settingWidth) . '-+-' . str_repeat('-', $valueWidth) . '-+';
+        $lines = [
+            '',
+            $rule,
+            sprintf(
+                '| %-' . $sectionWidth . 's | %-' . $settingWidth . 's | %-' . $valueWidth . 's |',
+                'section',
+                'setting',
+                'value',
+            ),
+            $rule,
+        ];
+
+        $lastSection = null;
+
+        foreach ($rows as $row) {
+            if ($lastSection !== null && $lastSection !== $row['section']) {
+                $lines[] = $rule;
+            }
+
+            $lastSection = $row['section'];
+            $lines[] = sprintf(
+                '| %-' . $sectionWidth . 's | %-' . $settingWidth . 's | %-' . $valueWidth . 's |',
+                $row['section'],
+                $row['setting'],
+                self::formatValue($row['value']),
+            );
+        }
+
+        $lines[] = $rule;
+        $lines[] = '';
+
+        @file_put_contents($config->logFile ?? 'php://stderr', implode("\n", $lines) . "\n", FILE_APPEND);
+    }
+
+    /**
+     * @return list<array{section: string, setting: string, value: mixed}>
+     */
+    private static function baseRows(Config $config, string $runId): array
+    {
+        return [
+            ['section' => 'run', 'setting' => 'mode', 'value' => $config->mode],
+            ['section' => 'run', 'setting' => 'seed', 'value' => $config->seed],
+            ['section' => 'run', 'setting' => 'run_id', 'value' => $runId],
+            ['section' => 'run', 'setting' => 'server', 'value' => "http://{$config->host}:{$config->port}"],
+            ['section' => 'run', 'setting' => 'argv', 'value' => array_values(array_map('strval', $_SERVER['argv'] ?? []))],
+            ['section' => 'php_server', 'setting' => 'php', 'value' => $config->php],
+            ['section' => 'php_server', 'setting' => 'host', 'value' => $config->host],
+            ['section' => 'php_server', 'setting' => 'port', 'value' => $config->port],
+            ['section' => 'php_server', 'setting' => 'workers', 'value' => $config->workers],
+            ['section' => 'php_server', 'setting' => 'client', 'value' => $config->client],
+            ['section' => 'php_server', 'setting' => 'request_timeout_ms', 'value' => $config->requestTimeoutMs],
+            ['section' => 'php_server', 'setting' => 'watchdog_timeout_ms', 'value' => $config->watchdogTimeoutMs],
+            ['section' => 'redis', 'setting' => 'host', 'value' => $config->redisHost],
+            ['section' => 'redis', 'setting' => 'port', 'value' => $config->redisPort],
+            ['section' => 'redis', 'setting' => 'db', 'value' => $config->redisDb],
+            ['section' => 'relay_ini', 'setting' => 'relay.cache', 'value' => 1],
+            ['section' => 'relay_ini', 'setting' => 'relay.max_endpoint_dbs', 'value' => $config->relayMaxEndpointDbs],
+            ['section' => 'relay_ini', 'setting' => 'relay.max_db_writers', 'value' => $config->relayMaxDbWriters],
+            ['section' => 'keys', 'setting' => 'keys', 'value' => $config->keys],
+            ['section' => 'keys', 'setting' => 'keys_per_worker', 'value' => $config->keysPerWorker],
+            ['section' => 'keys', 'setting' => 'warmup_reads', 'value' => $config->warmupReads],
+            ['section' => 'keys', 'setting' => 'mutations', 'value' => $config->mutations],
+            ['section' => 'verification', 'setting' => 'verify_retries', 'value' => $config->verifyRetries],
+            ['section' => 'verification', 'setting' => 'verify_delay_us', 'value' => $config->verifyDelayUs],
+            ['section' => 'verification', 'setting' => 'delay_us', 'value' => $config->delayUs],
+            ['section' => 'random_kill', 'setting' => 'kill_rate', 'value' => $config->killRate],
+            ['section' => 'random_kill', 'setting' => 'max_kill', 'value' => $config->maxKill],
+            ['section' => 'random_kill', 'setting' => 'signal_weights', 'value' => self::formatSignalWeights($config->signalWeights)],
+            ['section' => 'signals', 'setting' => 'simple_sequential_signals', 'value' => array_map(self::signalName(...), $config->signals)],
+            ['section' => 'limits', 'setting' => 'duration_seconds', 'value' => $config->durationSeconds],
+            ['section' => 'limits', 'setting' => 'commands_per_worker', 'value' => $config->commandsPerWorker],
+            ['section' => 'logging', 'setting' => 'log_level', 'value' => $config->logLevel],
+            ['section' => 'logging', 'setting' => 'log_file', 'value' => $config->logFile],
+            ['section' => 'logging', 'setting' => 'verbose', 'value' => $config->verbose],
+            ['section' => 'diagnostics', 'setting' => 'keep_temp', 'value' => $config->keepTemp],
+            ['section' => 'diagnostics', 'setting' => 'fail_fast', 'value' => $config->failFast],
+            ['section' => 'replay_rr', 'setting' => 'replay_file', 'value' => $config->replayFile],
+            ['section' => 'replay_rr', 'setting' => 'rr', 'value' => $config->rr],
+            ['section' => 'replay_rr', 'setting' => 'rr_trace_dir', 'value' => $config->rrTraceDir],
+        ];
+    }
+
+    /**
+     * @param array<int, int> $signalWeights
+     * @return array<string, int>
+     */
+    private static function formatSignalWeights(array $signalWeights): array
+    {
+        $out = [];
+
+        foreach ($signalWeights as $signal => $weight) {
+            $out[self::signalName((int) $signal)] = $weight;
+        }
+
+        return $out;
+    }
+
+    private static function formatValue(mixed $value): string
+    {
+        if ($value === null) {
+            return 'null';
+        }
+
+        if (is_bool($value)) {
+            return $value ? 'true' : 'false';
+        }
+
+        if (is_scalar($value)) {
+            return (string) $value;
+        }
+
+        return json_encode($value, JSON_UNESCAPED_SLASHES | JSON_THROW_ON_ERROR);
+    }
+
+    private static function signalName(int $signal): string
+    {
+        return match ($signal) {
+            2 => 'SIGINT',
+            3 => 'SIGQUIT',
+            6 => 'SIGABRT',
+            9 => 'SIGKILL',
+            15 => 'SIGTERM',
+            default => 'SIG' . $signal,
+        };
+    }
+}
+
 final class RingBuffer
 {
     /** @var list<mixed> */
@@ -773,6 +912,11 @@ final class Fuzzer
 
     public function run(): void
     {
+        StartupBlock::write($this->config, $this->runId, [
+            ['section' => 'mode', 'setting' => 'run_limit', 'value' => $this->runLimitDescription()],
+            ['section' => 'mode', 'setting' => 'deterministic_smoke', 'value' => $this->config->commandsPerWorker === null],
+        ]);
+
         $this->logger->info('starting fuzz run', [
             'seed' => $this->config->seed,
             'run_id' => $this->runId,
@@ -1496,6 +1640,11 @@ final class SequentialFuzzer
 
     public function run(): void
     {
+        StartupBlock::write($this->config, $this->runId, [
+            ['section' => 'mode', 'setting' => 'signal_strategy', 'value' => 'random'],
+            ['section' => 'mode', 'setting' => 'rr_trace_dir_actual', 'value' => $this->rrTraceDir],
+        ]);
+
         $this->logger->info('starting sequential fuzz run', [
             'seed' => $this->config->seed,
             'run_id' => $this->runId,
@@ -2432,6 +2581,12 @@ final class SimpleSequentialFuzzer
 
     public function run(): void
     {
+        StartupBlock::write($this->config, $this->runId, [
+            ['section' => 'mode', 'setting' => 'keyspace', 'value' => 'shared'],
+            ['section' => 'mode', 'setting' => 'mutations_per_worker_death', 'value' => $this->config->mutations],
+            ['section' => 'mode', 'setting' => 'rr_trace_dir_actual', 'value' => $this->rrTraceDir],
+        ]);
+
         $this->logger->info('starting simple sequential fuzz run', [
             'seed' => $this->config->seed,
             'run_id' => $this->runId,
