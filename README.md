@@ -117,7 +117,8 @@ Common options:
 - `--redis-port=6379`
 - `--redis-db=0`
 - `--workers=N`: `PHP_CLI_SERVER_WORKERS`.
-- `--duration=SECONDS`
+- `--duration=SECONDS`: randomized-mode wall-clock limit. Default: 60. Ignored when `--commands-per-worker` is set.
+- `--commands-per-worker=N`: randomized-mode command-count limit for small reproducers. The fuzzer stops after roughly `N * --workers` successful worker-handled HTTP commands in the main fuzz phase, checked between iterations.
 - `--seed=N`
 - `--relay-max-endpoint-dbs=N`
 - `--relay-max-db-writers=N`

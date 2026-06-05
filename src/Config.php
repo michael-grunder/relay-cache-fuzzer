@@ -20,6 +20,7 @@ final class Config
         public readonly int $redisDb,
         public readonly int $workers,
         public readonly int $durationSeconds,
+        public readonly ?int $commandsPerWorker,
         public readonly int $seed,
         public readonly int $relayMaxEndpointDbs,
         public readonly int $relayMaxDbWriters,
@@ -64,6 +65,7 @@ final class Config
             redisDb: self::int($raw, 'redis-db', 0),
             workers: max(1, self::int($raw, 'workers', 2)),
             durationSeconds: max(1, self::int($raw, 'duration', 60)),
+            commandsPerWorker: isset($raw['commands-per-worker']) ? max(1, self::int($raw, 'commands-per-worker')) : null,
             seed: $seed,
             relayMaxEndpointDbs: max(1, self::int($raw, 'relay-max-endpoint-dbs', 1)),
             relayMaxDbWriters: max(1, self::int($raw, 'relay-max-db-writers', 1)),
@@ -101,6 +103,7 @@ final class Config
             redisDb: $this->redisDb,
             workers: $this->workers,
             durationSeconds: $this->durationSeconds,
+            commandsPerWorker: $this->commandsPerWorker,
             seed: $this->seed,
             relayMaxEndpointDbs: $this->relayMaxEndpointDbs,
             relayMaxDbWriters: $this->relayMaxDbWriters,
@@ -166,15 +169,173 @@ final class Config
 
     private static function printHelp(): void
     {
-        echo "Usage: bin/relay-cache-fuzzer --php=/path/to/php [options]\n";
-        echo "\n";
-        echo "Options include --mode=normal|sequential, --client=relay|redis, --host, --port, --redis-host, --redis-port, --redis-db,\n";
-        echo "--workers, --duration, --seed, --relay-max-endpoint-dbs,\n";
-        echo "--relay-max-db-writers, --kill-rate, --max-kill, --keys-per-worker,\n";
-        echo "--warmup-reads, --verify-retries, --verify-delay-us, --delay-us,\n";
-        echo "--request-timeout-ms, --signal-mix, --log-level, --log-file,\n";
-        echo "--replay, --rr, --rr-trace-dir, --verbose,\n";
-        echo "--keep-temp, and --fail-fast.\n";
+        echo <<<'HELP'
+Relay cache fuzzer
+
+Usage:
+  bin/relay-cache-fuzzer [options]
+  bin/relay-cache-fuzzer --mode=normal --php=/path/to/php --duration=30
+  bin/relay-cache-fuzzer --mode=normal --commands-per-worker=5 --seed=1234
+  bin/relay-cache-fuzzer --mode=sequential --workers=4 --delay-us=50000
+  bin/relay-cache-fuzzer --replay=reproducers/random/00001/reproducer.json
+
+Purpose:
+  Exercises Relay cache invalidation when PHP CLI-server workers cache keys,
+  die, are replaced, and later serve reads for keys that were changed directly
+  in Redis by the driver.
+
+Run modes:
+  --mode=normal
+      Randomized fuzzing. The driver discovers workers, warms keys through the
+      configured server-side client, mutates Redis directly, may kill one or
+      more workers, and verifies reads through the PHP server. This is the
+      default.
+
+  --mode=sequential
+      Deterministic worker-shutdown sequence. Workers are discovered, warmed,
+      killed one at a time, and surviving workers are queried for stale values.
+      This mode is slower and more structured, which is useful after the random
+      mode has identified a bug class.
+
+Execution limit:
+  --duration=SECONDS
+      Run randomized fuzzing for this many seconds. Must be an integer >= 1.
+      Default: 60. Ignored when --commands-per-worker is specified.
+
+  --commands-per-worker=N
+      Randomized-mode command-count limit for small reproducers. Instead of
+      running by wall-clock duration, stop after approximately N successful
+      HTTP commands per configured worker in the main fuzz phase. The total
+      target is N * --workers. Must be an integer >= 1.
+
+      The limit is checked between randomized iterations, so the final command
+      count can exceed the exact target by the size of one iteration. Use small
+      values such as 1, 2, 5, or 10 when reducing failures.
+
+Server and client:
+  --php=PATH
+      PHP binary used for the CLI server. Default: the PHP binary running this
+      script. Prefer a PHP build-tree binary such as ../php-*/sapi/cli/php when
+      testing Relay from source.
+
+  --client=relay|redis
+      Server-side Redis client used by router.php. relay tests Relay\Relay.
+      redis uses PhpRedis as a control to validate the fuzzer mechanism.
+      Default: relay.
+
+  --host=HOST
+      PHP CLI-server bind host. Default: 127.0.0.1.
+
+  --port=PORT
+      PHP CLI-server port. Use 0 to pick a free port. Default: 0.
+
+  --workers=N
+      PHP_CLI_SERVER_WORKERS value. Must be an integer >= 1. Default: 2.
+
+Redis:
+  --redis-host=HOST
+      Redis host used by both the driver and router. Default: 127.0.0.1.
+
+  --redis-port=PORT
+      Redis TCP port. Default: 6379.
+
+  --redis-db=N
+      Redis database number. Default: 0.
+
+Relay INI:
+  --relay-max-endpoint-dbs=N
+      relay.max_endpoint_dbs passed to the PHP CLI server. Must be >= 1.
+      Default: 1.
+
+  --relay-max-db-writers=N
+      relay.max_db_writers passed to the PHP CLI server. Must be >= 1.
+      Default: 1.
+
+Randomized fuzzing:
+  --seed=N
+      Random seed. If omitted, a seed is generated and logged. Reuse a printed
+      seed to replay the same pseudo-random choices.
+
+  --kill-rate=FLOAT
+      Probability that a randomized iteration kills workers. Valid values are
+      clamped to 0.0 through 1.0. Default: 0.25.
+
+  --max-kill=N
+      Maximum workers to kill in one randomized iteration. Must be >= 1.
+      Default: 1.
+
+  --signal-mix=SPEC
+      Weighted signal distribution for worker kills. SPEC is a comma-separated
+      list of signal names and optional weights. Supported signals are TERM,
+      INT, and KILL, with or without a SIG prefix. Default:
+      TERM:60,INT:20,KILL:20.
+
+      Examples: --signal-mix=TERM, --signal-mix=SIGTERM:90,SIGKILL:10
+
+Keys and verification:
+  --keys-per-worker=N
+      Redis keys assigned to each observed worker PID. Must be >= 1.
+      Default: 4.
+
+  --warmup-reads=N
+      Number of repeated reads performed by each /warm request. Must be >= 1.
+      Default: 16.
+
+  --verify-retries=N
+      Number of /get attempts before a mismatched value is considered a
+      persistent stale failure. Must be >= 1. Default: 8.
+
+  --verify-delay-us=N
+      Microseconds to wait between verification retries. Must be >= 0.
+      Default: 50000.
+
+  --delay-us=N
+      Sequential-mode delay between operations. Must be >= 0. Default: 50000.
+
+Timeouts and watchdog:
+  --request-timeout-ms=N
+      Per-request HTTP and Redis timeout in milliseconds. Must be >= 1.
+      Default: 1000.
+
+  --watchdog-timeout-ms=N
+      Abort if no successful request completes within this many milliseconds.
+      Must be >= 1. Default: 5000.
+
+Logging and diagnostics:
+  --log-level=LEVEL
+      Human log level. Valid values: debug, info, notice, warning, error,
+      critical, alert, emergency. warn is accepted as warning. Default: info,
+      or debug when --verbose is set.
+
+  --log-file=PATH
+      Write human diagnostics to PATH instead of stderr.
+
+  --verbose
+      Shortcut for --log-level=debug unless --log-level is also specified.
+
+  --keep-temp
+      Preserve temporary diagnostic directories that would otherwise be removed.
+
+  --fail-fast
+      Parsed for compatibility with reproducer command lines.
+
+Replay and rr:
+  --replay=PATH
+      Replay a randomized reproducer JSON file. The replay is best-effort
+      because PHP CLI-server worker scheduling is not deterministic.
+
+  --rr
+      Run the PHP CLI server under rr record in sequential mode.
+
+  --rr-trace-dir=PATH
+      Use PATH as the rr trace root. The fuzzer creates a unique run directory
+      below it.
+
+Help:
+  -h, --help
+      Show this help text.
+
+HELP;
     }
 
     /**

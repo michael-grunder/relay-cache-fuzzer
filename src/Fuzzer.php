@@ -719,6 +719,9 @@ final class Fuzzer
     /** @var array<int, true> */
     private array $killedPids = [];
 
+    /** @var array<int, int> */
+    private array $workerCommandCounts = [];
+
     /** @var array<string, int> */
     private array $stats = [
         'total_requests' => 0,
@@ -756,6 +759,7 @@ final class Fuzzer
             'server' => "http://{$this->config->host}:{$this->config->port}",
             'client' => $this->config->client,
             'workers' => $this->config->workers,
+            'run_limit' => $this->runLimitDescription(),
         ]);
 
         $this->logger->debug('connecting to Redis', [
@@ -778,11 +782,17 @@ final class Fuzzer
         try {
             $this->server->start();
             $this->waitUntilReady();
-            $this->deterministicSmoke();
 
+            if ($this->config->commandsPerWorker === null) {
+                $this->deterministicSmoke();
+            } else {
+                $this->logger->info('skipping deterministic smoke phase for command-count run');
+            }
+
+            $baseSuccessfulRequests = $this->stats['successful_requests'];
             $deadline = microtime(true) + $this->config->durationSeconds;
 
-            while (microtime(true) < $deadline) {
+            while ($this->shouldContinueFuzzing($deadline, $baseSuccessfulRequests)) {
                 $this->iteration();
             }
 
@@ -791,6 +801,7 @@ final class Fuzzer
             $this->logger->info('completed fuzz run', [
                 'iterations' => $this->stats['iterations'],
                 'requests' => $this->stats['total_requests'],
+                'main_phase_successful_commands' => $this->stats['successful_requests'] - $baseSuccessfulRequests,
                 'stale_observations' => $this->stats['stale_observations'],
             ]);
         } catch (Throwable $e) {
@@ -800,6 +811,28 @@ final class Fuzzer
         } finally {
             $this->server->stop();
         }
+    }
+
+    private function shouldContinueFuzzing(float $deadline, int $baseSuccessfulRequests): bool
+    {
+        if ($this->config->commandsPerWorker === null) {
+            return microtime(true) < $deadline;
+        }
+
+        $target = $this->config->commandsPerWorker * $this->config->workers;
+
+        return ($this->stats['successful_requests'] - $baseSuccessfulRequests) < $target;
+    }
+
+    private function runLimitDescription(): string
+    {
+        if ($this->config->commandsPerWorker !== null) {
+            $target = $this->config->commandsPerWorker * $this->config->workers;
+
+            return "commands_per_worker={$this->config->commandsPerWorker} target_successful_commands={$target}";
+        }
+
+        return "duration_seconds={$this->config->durationSeconds}";
     }
 
     private function waitUntilReady(): void
@@ -1193,16 +1226,22 @@ final class Fuzzer
             $this->stats['successful_requests']++;
             $this->lastSuccessAt = microtime(true);
             $elapsedMs = (int) round((microtime(true) - $startedAt) * 1000);
+            $pid = is_int($response['pid'] ?? null) ? $response['pid'] : null;
+
+            if ($pid !== null) {
+                $this->workerCommandCounts[$pid] = ($this->workerCommandCounts[$pid] ?? 0) + 1;
+            }
+
             $this->lastRequests->push([
                 'path' => $path,
                 'ok' => true,
                 'elapsed_ms' => $elapsedMs,
-                'pid' => $response['pid'] ?? null,
+                'pid' => $pid,
             ]);
             $this->logger->debug('request completed', [
                 'path' => $path,
                 'elapsed_ms' => $elapsedMs,
-                'pid' => $response['pid'] ?? null,
+                'pid' => $pid,
             ]);
 
             return $response;
@@ -1297,6 +1336,13 @@ final class Fuzzer
             'seed' => $this->config->seed,
             'php' => $this->config->php,
             'client' => $this->config->client,
+            'run_limit' => [
+                'duration_seconds' => $this->config->durationSeconds,
+                'commands_per_worker' => $this->config->commandsPerWorker,
+                'target_successful_commands' => $this->config->commandsPerWorker === null
+                    ? null
+                    : $this->config->commandsPerWorker * $this->config->workers,
+            ],
             'run_id' => $this->runId,
             'server' => [
                 'host' => $this->config->host,
@@ -1321,6 +1367,7 @@ final class Fuzzer
                 'relay.cache' => 1,
             ],
             'stats' => $this->stats,
+            'worker_command_counts' => $this->workerCommandCounts,
             'last_requests' => $this->lastRequests->all(),
             'last_mutations' => $this->lastMutations->all(),
             'last_stale_observations' => $this->lastStale->all(),
