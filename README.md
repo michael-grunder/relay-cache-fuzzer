@@ -108,7 +108,7 @@ return the latest Redis generation.
 
 Common options:
 
-- `--mode=normal|sequential`: choose randomized fuzzing or the deterministic worker shutdown sequence.
+- `--mode=normal|sequential|simple-sequential`: choose randomized fuzzing, the worker-owned deterministic shutdown sequence, or the shared-key sequential stale-cache mode.
 - `--php=/path/to/php`: PHP binary used for the CLI server.
 - `--client=relay|redis`: Redis client used by the CLI server. `relay` tests `Relay\Relay`; `redis` uses PhpRedis as a sanity check for the fuzzing mechanism.
 - `--host=127.0.0.1`: CLI server bind host.
@@ -124,6 +124,8 @@ Common options:
 - `--relay-max-db-writers=N`
 - `--kill-rate=FLOAT`
 - `--max-kill=N`
+- `--keys=N`: shared keyspace size for `simple-sequential`.
+- `--mutations=N`: Redis mutations after each worker death in `simple-sequential`.
 - `--keys-per-worker=N`
 - `--warmup-reads=N`
 - `--verify-retries=N`
@@ -132,9 +134,10 @@ Common options:
 - `--request-timeout-ms=N`
 - `--watchdog-timeout-ms=N`
 - `--signal-mix=TERM:60,INT:20,KILL:20`
+- `--signals=SIGINT,SIGTERM,SIGQUIT`: signal set for `simple-sequential`.
 - `--log-level=info`: one of `debug`, `info`, `notice`, `warning`, `error`, `critical`, `alert`, `emergency`. `--verbose` is equivalent to `--log-level=debug` unless an explicit level is passed.
 - `--log-file=PATH`: write human diagnostics to a file instead of stderr.
-- `--rr`: run the PHP CLI server under `rr record` in sequential mode.
+- `--rr`: run the PHP CLI server under `rr record` in sequential modes.
 - `--rr-trace-dir=PATH`: use `PATH` as the rr trace root. The fuzzer creates a unique run directory below it.
 - `--verbose`
 - `--keep-temp`

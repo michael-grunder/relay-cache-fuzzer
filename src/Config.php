@@ -8,6 +8,7 @@ final class Config
 {
     /**
      * @param array<int, int> $signalWeights
+     * @param list<int> $signals
      */
     private function __construct(
         public readonly string $mode,
@@ -26,6 +27,8 @@ final class Config
         public readonly int $relayMaxDbWriters,
         public readonly float $killRate,
         public readonly int $maxKill,
+        public readonly int $keys,
+        public readonly int $mutations,
         public readonly int $keysPerWorker,
         public readonly int $warmupReads,
         public readonly int $verifyRetries,
@@ -39,6 +42,7 @@ final class Config
         public readonly bool $keepTemp,
         public readonly bool $failFast,
         public readonly array $signalWeights,
+        public readonly array $signals,
         public readonly ?string $replayFile,
         public readonly bool $rr,
         public readonly ?string $rrTraceDir,
@@ -71,6 +75,8 @@ final class Config
             relayMaxDbWriters: max(1, self::int($raw, 'relay-max-db-writers', 1)),
             killRate: max(0.0, min(1.0, self::float($raw, 'kill-rate', 0.25))),
             maxKill: max(1, self::int($raw, 'max-kill', 1)),
+            keys: max(1, self::int($raw, 'keys', 100)),
+            mutations: max(1, self::int($raw, 'mutations', 1)),
             keysPerWorker: max(1, self::int($raw, 'keys-per-worker', 4)),
             warmupReads: max(1, self::int($raw, 'warmup-reads', 16)),
             verifyRetries: max(1, self::int($raw, 'verify-retries', 8)),
@@ -84,6 +90,7 @@ final class Config
             keepTemp: self::bool($raw, 'keep-temp'),
             failFast: self::bool($raw, 'fail-fast'),
             signalWeights: self::parseSignalMix(self::string($raw, 'signal-mix', 'TERM:60,INT:20,KILL:20')),
+            signals: self::parseSignals(self::string($raw, 'signals', 'SIGINT,SIGTERM,SIGQUIT')),
             replayFile: isset($raw['replay']) ? self::string($raw, 'replay') : null,
             rr: self::bool($raw, 'rr'),
             rrTraceDir: isset($raw['rr-trace-dir']) ? self::string($raw, 'rr-trace-dir') : null,
@@ -109,6 +116,8 @@ final class Config
             relayMaxDbWriters: $this->relayMaxDbWriters,
             killRate: $this->killRate,
             maxKill: $this->maxKill,
+            keys: $this->keys,
+            mutations: $this->mutations,
             keysPerWorker: $this->keysPerWorker,
             warmupReads: $this->warmupReads,
             verifyRetries: $this->verifyRetries,
@@ -122,6 +131,7 @@ final class Config
             keepTemp: $this->keepTemp,
             failFast: $this->failFast,
             signalWeights: $this->signalWeights,
+            signals: $this->signals,
             replayFile: $this->replayFile,
             rr: $this->rr,
             rrTraceDir: $this->rrTraceDir,
@@ -177,6 +187,7 @@ Usage:
   bin/relay-cache-fuzzer --mode=normal --php=/path/to/php --duration=30
   bin/relay-cache-fuzzer --mode=normal --commands-per-worker=5 --seed=1234
   bin/relay-cache-fuzzer --mode=sequential --workers=4 --delay-us=50000
+  bin/relay-cache-fuzzer --mode=simple-sequential --workers=4 --keys=100 --mutations=5
   bin/relay-cache-fuzzer --replay=reproducers/random/00001/reproducer.json
 
 Purpose:
@@ -196,6 +207,13 @@ Run modes:
       killed one at a time, and surviving workers are queried for stale values.
       This mode is slower and more structured, which is useful after the random
       mode has identified a bug class.
+
+  --mode=simple-sequential
+      Simplified shared-key sequential mode. The driver flushes Redis, creates
+      one deterministic shared keyspace, warms it through the PHP server, then
+      repeatedly kills one initially discovered worker, mutates Redis directly,
+      and verifies the entire keyspace through Relay. This mode does not assign
+      keys to workers and is intended for rr-friendly stale-cache debugging.
 
 Execution limit:
   --duration=SECONDS
@@ -273,6 +291,19 @@ Randomized fuzzing:
       Examples: --signal-mix=TERM, --signal-mix=SIGTERM:90,SIGKILL:10
 
 Keys and verification:
+  --keys=N
+      Shared keyspace size for simple-sequential mode. Must be >= 1.
+      Default: 100.
+
+  --mutations=N
+      Number of random Redis mutations after each worker death in
+      simple-sequential mode. Must be >= 1. Default: 1.
+
+  --signals=SIGINT,SIGTERM,SIGQUIT
+      Comma-separated signal set for simple-sequential worker kills. Supported
+      signals are INT, TERM, QUIT, KILL, and ABRT, with or without a SIG prefix.
+      Default: SIGINT,SIGTERM,SIGQUIT.
+
   --keys-per-worker=N
       Redis keys assigned to each observed worker PID. Must be >= 1.
       Default: 4.
@@ -325,7 +356,7 @@ Replay and rr:
       because PHP CLI-server worker scheduling is not deterministic.
 
   --rr
-      Run the PHP CLI server under rr record in sequential mode.
+      Run the PHP CLI server under rr record in sequential modes.
 
   --rr-trace-dir=PATH
       Use PATH as the rr trace root. The fuzzer creates a unique run directory
@@ -415,8 +446,8 @@ HELP;
     {
         $mode = strtolower($mode);
 
-        if (!in_array($mode, ['normal', 'sequential'], true)) {
-            throw new FuzzerException('--mode must be one of normal, sequential');
+        if (!in_array($mode, ['normal', 'sequential', 'simple-sequential'], true)) {
+            throw new FuzzerException('--mode must be one of normal, sequential, simple-sequential');
         }
 
         return $mode;
@@ -467,5 +498,38 @@ HELP;
         }
 
         return $weights;
+    }
+
+    /**
+     * @return list<int>
+     */
+    private static function parseSignals(string $list): array
+    {
+        $supported = ['INT' => 2, 'TERM' => 15, 'QUIT' => 3, 'KILL' => 9, 'ABRT' => 6];
+        $signals = [];
+
+        foreach (explode(',', $list) as $part) {
+            $name = strtoupper(trim($part));
+
+            if ($name === '') {
+                continue;
+            }
+
+            if (str_starts_with($name, 'SIG')) {
+                $name = substr($name, 3);
+            }
+
+            if (!isset($supported[$name])) {
+                throw new FuzzerException("Unsupported signal in --signals: {$name}");
+            }
+
+            $signals[] = $supported[$name];
+        }
+
+        if ($signals === []) {
+            throw new FuzzerException('--signals must contain at least one signal');
+        }
+
+        return array_values(array_unique($signals));
     }
 }
