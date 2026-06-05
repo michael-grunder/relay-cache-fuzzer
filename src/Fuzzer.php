@@ -173,39 +173,17 @@ final class StartupBlock
     public static function write(Config $config, string $runId, array $modeRows = []): void
     {
         $rows = array_merge(self::baseRows($config, $runId), $modeRows);
-        $sectionWidth = max(array_map(static fn (array $row): int => strlen($row['section']), $rows));
-        $settingWidth = max(array_map(static fn (array $row): int => strlen($row['setting']), $rows));
-        $valueWidth = max(array_map(static fn (array $row): int => strlen(self::formatValue($row['value'])), $rows));
-        $rule = '+-' . str_repeat('-', $sectionWidth) . '-+-' . str_repeat('-', $settingWidth) . '-+-' . str_repeat('-', $valueWidth) . '-+';
-        $lines = [
-            '',
-            $rule,
-            sprintf(
-                '| %-' . $sectionWidth . 's | %-' . $settingWidth . 's | %-' . $valueWidth . 's |',
-                'section',
-                'setting',
-                'value',
-            ),
-            $rule,
-        ];
-
-        $lastSection = null;
+        $labelWidth = max(array_map(static fn (array $row): int => strlen(self::formatLabel($row)), $rows));
+        $lines = [''];
 
         foreach ($rows as $row) {
-            if ($lastSection !== null && $lastSection !== $row['section']) {
-                $lines[] = $rule;
-            }
-
-            $lastSection = $row['section'];
             $lines[] = sprintf(
-                '| %-' . $sectionWidth . 's | %-' . $settingWidth . 's | %-' . $valueWidth . 's |',
-                $row['section'],
-                $row['setting'],
-                self::formatValue($row['value']),
+                '%-' . $labelWidth . 's : %s',
+                self::formatLabel($row),
+                self::formatValue($row['value'], $row['setting']),
             );
         }
 
-        $lines[] = $rule;
         $lines[] = '';
 
         @file_put_contents($config->logFile ?? 'php://stderr', implode("\n", $lines) . "\n", FILE_APPEND);
@@ -274,7 +252,56 @@ final class StartupBlock
         return $out;
     }
 
-    private static function formatValue(mixed $value): string
+    /**
+     * @param array{section: string, setting: string, value: mixed} $row
+     */
+    private static function formatLabel(array $row): string
+    {
+        $setting = $row['setting'];
+        $label = match ($setting) {
+            'argv' => 'Argv',
+            'commands_per_worker' => 'Commands',
+            'db' => 'DB',
+            'delay_us' => 'Delay',
+            'duration_seconds' => 'Duration',
+            'fail_fast' => 'Fail Fast',
+            'keep_temp' => 'Keep Temp',
+            'log_file' => 'Log File',
+            'log_level' => 'Log Level',
+            'max_kill' => 'Max Kill',
+            'php' => 'PHP',
+            'relay.max_db_writers' => 'Relay Max DB Writers',
+            'relay.max_endpoint_dbs' => 'Relay Max Endpoint DBs',
+            'replay_file' => 'Replay File',
+            'request_timeout_ms' => 'Request Timeout',
+            'rr' => 'RR',
+            'rr_trace_dir' => 'RR Trace Dir',
+            'rr_trace_dir_actual' => 'RR Trace Dir Actual',
+            'run_id' => 'Run ID',
+            'signal_weights' => 'Signal Weights',
+            'simple_sequential_signals' => 'Simple Sequential Signals',
+            'verify_delay_us' => 'Verify Delay',
+            'watchdog_timeout_ms' => 'Watchdog Timeout',
+            default => ucwords(str_replace(['_', '.'], ' ', $setting)),
+        };
+
+        if (in_array($setting, ['client', 'host', 'port'], true)) {
+            return self::formatSection($row['section']) . ' ' . $label;
+        }
+
+        return $label;
+    }
+
+    private static function formatSection(string $section): string
+    {
+        return match ($section) {
+            'php_server' => 'PHP Server',
+            'redis' => 'Redis',
+            default => ucwords(str_replace('_', ' ', $section)),
+        };
+    }
+
+    private static function formatValue(mixed $value, string $setting = ''): string
     {
         if ($value === null) {
             return 'null';
@@ -285,6 +312,26 @@ final class StartupBlock
         }
 
         if (is_scalar($value)) {
+            if (is_int($value)) {
+                if (in_array($setting, ['db', 'port', 'redis_port', 'seed'], true)) {
+                    return (string) $value;
+                }
+
+                if (str_ends_with($setting, '_us')) {
+                    return number_format($value) . 'us';
+                }
+
+                if (str_ends_with($setting, '_ms')) {
+                    return number_format($value) . 'ms';
+                }
+
+                if (str_ends_with($setting, '_seconds')) {
+                    return number_format($value) . 's';
+                }
+
+                return number_format($value);
+            }
+
             return (string) $value;
         }
 
