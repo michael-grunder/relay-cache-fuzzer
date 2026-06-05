@@ -1579,17 +1579,21 @@ final class SequentialFuzzer
     {
         $attempts = 0;
         $deadline = microtime(true) + max(5.0, $this->config->watchdogTimeoutMs / 1000);
+        $responsePidCounts = [];
+        $nullResponses = 0;
 
         while (microtime(true) < $deadline) {
             $attempts++;
             $response = $this->tryRequest('/warm?key=' . rawurlencode($key) . '&n=' . $this->config->warmupReads);
 
             if ($response === null) {
+                $nullResponses++;
                 usleep(10_000);
                 continue;
             }
 
             $pid = $this->responsePid($response);
+            $responsePidCounts[$pid] = ($responsePidCounts[$pid] ?? 0) + 1;
             $this->observePid($pid);
             $tracked = $response['tracked'] ?? null;
             $value = $response['value'] === null ? null : (string) $response['value'];
@@ -1612,13 +1616,30 @@ final class SequentialFuzzer
                 return;
             }
 
+            if ($attempts % 100 === 0) {
+                $this->logger->debug('warm request has not reached target worker', [
+                    'target_pid' => $targetPid,
+                    'key' => $key,
+                    'attempts' => $attempts,
+                    'response_pid_counts' => $responsePidCounts,
+                    'null_responses' => $nullResponses,
+                ]);
+            }
+
             usleep(10_000);
         }
 
+        ksort($responsePidCounts);
         $this->fail('Could not route warmup request to target worker', [
             'pid' => $targetPid,
             'key' => $key,
             'attempts' => $attempts,
+            'null_responses' => $nullResponses,
+            'response_pid_counts' => $responsePidCounts,
+            'parent_pid' => $this->server->parentPid(),
+            'observed_pids' => array_map('intval', array_keys($this->workers)),
+            'alive_pids' => array_map('intval', array_keys($this->aliveWorkers)),
+            'process_states' => $this->processStates([$targetPid, ...array_keys($this->workers)]),
         ]);
     }
 
@@ -1950,6 +1971,52 @@ final class SequentialFuzzer
         }
 
         return true;
+    }
+
+    /**
+     * @param list<int> $pids
+     * @return array<int, array<string, mixed>>
+     */
+    private function processStates(array $pids): array
+    {
+        $states = [];
+
+        $parentPid = $this->server->parentPid();
+        if ($parentPid !== null) {
+            $pids[] = $parentPid;
+        }
+
+        foreach (array_unique($pids) as $pid) {
+            $states[(int) $pid] = $this->processState((int) $pid);
+        }
+
+        ksort($states);
+
+        return $states;
+    }
+
+    /**
+     * @return array<string, mixed>
+     */
+    private function processState(int $pid): array
+    {
+        $state = [
+            'exists' => $this->processExists($pid),
+        ];
+
+        $stat = @file_get_contents("/proc/{$pid}/stat");
+        if (is_string($stat) && preg_match('/^(\d+)\s+\((.*)\)\s+([A-Z])\s+(\d+)/', $stat, $matches)) {
+            $state['comm'] = $matches[2];
+            $state['state'] = $matches[3];
+            $state['ppid'] = (int) $matches[4];
+        }
+
+        $wchan = @file_get_contents("/proc/{$pid}/wchan");
+        if (is_string($wchan)) {
+            $state['wchan'] = trim($wchan);
+        }
+
+        return $state;
     }
 
     /**
