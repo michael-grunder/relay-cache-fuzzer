@@ -5,6 +5,7 @@ declare(strict_types=1);
 
 use MichaelGrunder\RelayCacheFuzzer\Config;
 use MichaelGrunder\RelayCacheFuzzer\Fuzzer;
+use MichaelGrunder\RelayCacheFuzzer\FuzzerException;
 use MichaelGrunder\RelayCacheFuzzer\ReplayRunner;
 use MichaelGrunder\RelayCacheFuzzer\SequentialFuzzer;
 use MichaelGrunder\RelayCacheFuzzer\SimpleSequentialFuzzer;
@@ -30,5 +31,5 @@ try {
     }
 } catch (Throwable $e) {
     fwrite(STDERR, $e->getMessage() . PHP_EOL);
-    exit(1);
+    exit($e instanceof FuzzerException && str_contains($e->getMessage(), 'reproducer=') ? 2 : 1);
 }

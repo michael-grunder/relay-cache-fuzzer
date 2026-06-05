@@ -950,7 +950,7 @@ final class Fuzzer
         $this->config = $config->port === 0 ? $config->withPort(self::pickFreePort($config->host)) : $config;
         $this->logger = LogFactory::create($this->config);
         $this->rng = new Rng($this->config->seed);
-        $this->runId = dechex($this->config->seed) . '-' . bin2hex(random_bytes(3));
+        $this->runId = $this->config->runId ?? dechex($this->config->seed) . '-' . bin2hex(random_bytes(3));
         $this->lastRequests = new RingBuffer(100);
         $this->lastMutations = new RingBuffer(100);
         $this->lastStale = new RingBuffer(100);
@@ -1706,7 +1706,7 @@ final class SequentialFuzzer
         $this->config = $config->port === 0 ? $config->withPort(self::pickFreePort($config->host)) : $config;
         $this->logger = LogFactory::create($this->config);
         $this->rng = new Rng($this->config->seed);
-        $this->runId = dechex($this->config->seed) . '-seq-' . bin2hex(random_bytes(3));
+        $this->runId = $this->config->runId ?? dechex($this->config->seed) . '-seq-' . bin2hex(random_bytes(3));
         $this->rrTraceDir = $this->prepareRrTraceDir();
     }
 
@@ -2668,7 +2668,7 @@ final class SimpleSequentialFuzzer
         $this->config = $config->port === 0 ? $config->withPort(self::pickFreePort($config->host)) : $config;
         $this->logger = LogFactory::create($this->config);
         $this->rng = new Rng($this->config->seed);
-        $this->runId = dechex($this->config->seed) . '-simple-seq-' . bin2hex(random_bytes(3));
+        $this->runId = $this->config->runId ?? dechex($this->config->seed) . '-simple-seq-' . bin2hex(random_bytes(3));
         $this->rrTraceDir = $this->prepareRrTraceDir();
     }
 
@@ -2740,8 +2740,13 @@ final class SimpleSequentialFuzzer
 
     private function initializeKeyspace(): void
     {
-        $this->redis->flushDb();
-        $this->recordEvent('flushdb', ['phase' => 'init']);
+        if ($this->config->keyspaceIsolated) {
+            $this->recordEvent('isolate_keyspace', ['phase' => 'init']);
+        } else {
+            $this->redis->flushDb();
+            $this->recordEvent('flushdb', ['phase' => 'init']);
+        }
+
         $this->keys = [];
         $this->expected = [];
 
@@ -2753,7 +2758,12 @@ final class SimpleSequentialFuzzer
             $this->recordEvent('set', ['phase' => 'init', 'key' => $key, 'value' => '1']);
         }
 
-        $this->logLine('INIT', ['flushdb' => true, 'keys' => count($this->keys), 'value' => 1]);
+        $this->logLine('INIT', [
+            'flushdb' => !$this->config->keyspaceIsolated,
+            'keyspace_isolated' => $this->config->keyspaceIsolated,
+            'keys' => count($this->keys),
+            'value' => 1,
+        ]);
     }
 
     private function rebuildKeyspaceAfterFlush(): void
@@ -2978,8 +2988,14 @@ final class SimpleSequentialFuzzer
 
     private function performFlushDbMutation(): void
     {
-        $this->redis->flushDb();
-        $event = ['op' => 'FLUSHDB'];
+        if ($this->config->keyspaceIsolated) {
+            $this->redis->del($this->keys);
+            $event = ['op' => 'DEL_KEYSPACE', 'keys' => count($this->keys)];
+        } else {
+            $this->redis->flushDb();
+            $event = ['op' => 'FLUSHDB'];
+        }
+
         $this->lastMutation = $event;
         $this->mutations[] = $event;
         $this->stats['mutations']++;

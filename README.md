@@ -40,6 +40,37 @@ bin/relay-cache-fuzzer \
   --relay-max-db-writers=1
 ```
 
+Run a parallel harness campaign:
+
+```bash
+bin/harness \
+  --jobs=16 \
+  --work-dir="$PWD" \
+  -- \
+  bin/relay-cache-fuzzer \
+    --mode=simple-sequential \
+    --workers=8
+```
+
+The harness treats `relay-cache-fuzzer` as an inferior process. It appends a
+unique `--run-id`, `--seed`, and `--keyspace-isolated` to each run, records
+per-run logs under `artifacts/runs/`, and copies flaw artifacts into
+`artifacts/failures/000001`, `000002`, and so on. Inferior exit codes are:
+`0` for normal completion, `1` for setup or infrastructure errors, and `2` for
+flaws with reproducers.
+
+Integer fuzzer arguments can be templated for reduction:
+
+```bash
+bin/harness \
+  --jobs=32 \
+  --reduce \
+  -- \
+  bin/relay-cache-fuzzer \
+    --mode=normal \
+    --commands-per-worker='{{COMMANDS=10000}}'
+```
+
 Run a longer capacity-pressure test:
 
 ```bash

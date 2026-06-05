@@ -41,6 +41,8 @@ final class Config
         public readonly ?string $logFile,
         public readonly bool $keepTemp,
         public readonly bool $failFast,
+        public readonly ?string $runId,
+        public readonly bool $keyspaceIsolated,
         public readonly array $signalWeights,
         public readonly array $signals,
         public readonly ?string $replayFile,
@@ -89,6 +91,8 @@ final class Config
             logFile: isset($raw['log-file']) ? self::string($raw, 'log-file') : null,
             keepTemp: self::bool($raw, 'keep-temp'),
             failFast: self::bool($raw, 'fail-fast'),
+            runId: isset($raw['run-id']) ? self::runId(self::string($raw, 'run-id')) : null,
+            keyspaceIsolated: self::bool($raw, 'keyspace-isolated'),
             signalWeights: self::parseSignalMix(self::string($raw, 'signal-mix', 'TERM:60,INT:20,KILL:20')),
             signals: self::parseSignals(self::string($raw, 'signals', 'SIGINT,SIGTERM,SIGQUIT')),
             replayFile: isset($raw['replay']) ? self::string($raw, 'replay') : null,
@@ -130,6 +134,8 @@ final class Config
             logFile: $this->logFile,
             keepTemp: $this->keepTemp,
             failFast: $this->failFast,
+            runId: $this->runId,
+            keyspaceIsolated: $this->keyspaceIsolated,
             signalWeights: $this->signalWeights,
             signals: $this->signals,
             replayFile: $this->replayFile,
@@ -350,6 +356,14 @@ Logging and diagnostics:
   --fail-fast
       Parsed for compatibility with reproducer command lines.
 
+  --run-id=ID
+      Override the generated run identifier. Harness launches pass a globally
+      unique run id so parallel inferiors use disjoint Redis key names.
+
+  --keyspace-isolated
+      Avoid global Redis keyspace mutations such as FLUSHDB in modes that can
+      otherwise use them. This is intended for harness-launched parallel runs.
+
 Replay and rr:
   --replay=PATH
       Replay a randomized reproducer JSON file. The replay is best-effort
@@ -462,6 +476,15 @@ HELP;
         }
 
         return $client;
+    }
+
+    private static function runId(string $runId): string
+    {
+        if (!preg_match('/^[A-Za-z0-9][A-Za-z0-9_.:-]*$/', $runId)) {
+            throw new FuzzerException('--run-id must contain only letters, digits, dots, underscores, colons, or hyphens');
+        }
+
+        return $runId;
     }
 
     /**
