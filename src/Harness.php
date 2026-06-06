@@ -822,7 +822,7 @@ final class ReductionManager
 
         $task->stdoutPath = $dir . DIRECTORY_SEPARATOR . sprintf('attempt-%03d.stdout', $task->attempt);
         $task->stderrPath = $dir . DIRECTORY_SEPARATOR . sprintf('attempt-%03d.stderr', $task->attempt);
-        $command = self::withHarnessOptions($attemptValues->render($task->baseCommand), $task->seed, $task->runId);
+        $command = self::withHarnessOptions($attemptValues->render($task->baseCommand), $task->seed, $task->runId, 0);
         $process = new Process($command, getcwd() ?: null, null, null, null);
         $process->setTimeout(null);
         $task->process = $process;
@@ -884,11 +884,15 @@ final class ReductionManager
      * @param list<string> $command
      * @return list<string>
      */
-    public static function withHarnessOptions(array $command, int $seed, string $runId): array
+    public static function withHarnessOptions(array $command, int $seed, string $runId, ?int $jobIndex = null): array
     {
         $command[] = '--seed=' . $seed;
         $command[] = '--run-id=' . $runId;
         $command[] = '--keyspace-isolated';
+
+        if ($jobIndex !== null) {
+            $command[] = '--harness-job-index=' . $jobIndex;
+        }
 
         return $command;
     }
@@ -1234,6 +1238,7 @@ final class Coordinator
             $this->templateValues->render($this->config->inferiorCommand),
             $job->seed,
             $job->runId,
+            $job->id - 1,
         );
         file_put_contents($job->runDir . DIRECTORY_SEPARATOR . 'command.txt', ArtifactManager::formatCommand($job->command) . "\n");
 

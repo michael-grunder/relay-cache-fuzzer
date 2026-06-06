@@ -141,9 +141,10 @@ scheduling allows.
 
 ## How It Works
 
-The driver starts PHP's built-in CLI server with `PHP_CLI_SERVER_WORKERS=N`
-and serves [router.php](router.php). The router exposes deterministic endpoints
-that only read through Relay:
+The driver starts PHP's built-in CLI server with `PHP_CLI_SERVER_WORKERS=N`,
+or with `--fpm` starts an ephemeral static php-fpm pool behind a self-contained
+nginx instance. Both transports serve [router.php](router.php), which exposes
+deterministic endpoints that only read through Relay:
 
 - `GET /pid`
 - `GET /get?key=KEY`
@@ -172,13 +173,18 @@ Common options:
 
 - `--mode=normal|sequential|simple-sequential`: choose randomized fuzzing, the worker-owned deterministic shutdown sequence, or the shared-key sequential stale-cache mode.
 - `--php=/path/to/php`: PHP binary used for the CLI server.
-- `--client=relay|redis`: Redis client used by the CLI server. `relay` tests `Relay\Relay`; `redis` uses PhpRedis as a sanity check for the fuzzing mechanism.
-- `--host=127.0.0.1`: CLI server bind host.
-- `--port=0`: CLI server port. `0` chooses a free port.
+- `--fpm`: use generated php-fpm and nginx configs instead of PHP's CLI server.
+- `--php-fpm=/path/to/php-fpm`: php-fpm binary for `--fpm`. Default: `php-fpm`.
+- `--nginx=/path/to/nginx`: nginx binary for `--fpm`. Default: `nginx`.
+- `--fpm-conf-stub=PATH`: append global php-fpm settings to the generated config.
+- `--fpm-pool-conf-stub=PATH`: append pool settings to the generated pool config.
+- `--client=relay|redis`: Redis client used by router.php. `relay` tests `Relay\Relay`; `redis` uses PhpRedis as a sanity check for the fuzzing mechanism.
+- `--host=127.0.0.1`: server bind host.
+- `--port=0`: server port. `0` chooses a free port. Under `bin/harness --jobs=N`, `--fpm --port=BASE` uses `BASE + job_index` for job indexes `0..N-1`.
 - `--redis-host=127.0.0.1`
 - `--redis-port=6379`
 - `--redis-db=0`
-- `--workers=N`: `PHP_CLI_SERVER_WORKERS`.
+- `--workers=N`: CLI-server worker count, or static php-fpm worker count under `--fpm`.
 - `--duration=SECONDS`: randomized-mode wall-clock limit. Default: 60. Ignored when `--commands-per-worker` is set.
 - `--commands-per-worker=N`: randomized-mode command-count limit for small reproducers. The fuzzer stops after roughly `N * --workers` successful worker-handled HTTP commands in the main fuzz phase, checked between iterations.
 - `--seed=N`
@@ -217,13 +223,13 @@ By default, the fuzzer captures only `stale_key` reproducers. Use
 `--capture=stale_key,crash,stuck,other` or `--capture=all` to include other
 failure classes.
 
-On randomized-mode failure, the fuzzer writes a JSON reproducer file named like:
+On randomized-mode failure, the fuzzer writes a reproducer directory named like:
 
 ```text
 reproducers/random/stale_key/00001/reproducer.json
 ```
 
-The file includes:
+The `reproducer.json` file includes:
 
 - seed and run id
 - PHP binary and full server command line
@@ -233,6 +239,9 @@ The file includes:
 - request, mutation, and stale-observation tails
 - server stdout and stderr tails
 - the event stream leading to failure
+
+When `--fpm` is used, the bundle also includes `server-runtime/` with generated
+nginx/php-fpm configs and logs.
 
 Human diagnostics are written to stderr by default, or to `--log-file` when
 specified. TTY logs use concise microtime prefixes and rich styling for humans;
@@ -247,9 +256,9 @@ reproducers/sequential/stale_key/00001/
 ```
 
 The bundle contains `startup.json`, `reproducer.json`, `events.log`,
-`server.stdout`, `server.stderr`, and, when `--rr` was enabled and rr finalized
-the trace, an `rr/` copy. The fuzzer waits for rr `incomplete` markers to
-disappear before copying a trace into the bundle.
+`server.stdout`, `server.stderr`, `server-runtime/` for `--fpm` runs, and, when
+`--rr` was enabled and rr finalized the trace, an `rr/` copy. The fuzzer waits
+for rr `incomplete` markers to disappear before copying a trace into the bundle.
 
 Replay an event stream with:
 

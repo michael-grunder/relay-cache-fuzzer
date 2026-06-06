@@ -50,6 +50,12 @@ final class Config
         public readonly ?string $replayFile,
         public readonly bool $rr,
         public readonly ?string $rrTraceDir,
+        public readonly bool $fpm,
+        public readonly string $phpFpm,
+        public readonly string $nginx,
+        public readonly ?string $fpmConfStub,
+        public readonly ?string $fpmPoolConfStub,
+        public readonly ?int $harnessJobIndex,
     ) {
     }
 
@@ -62,12 +68,20 @@ final class Config
         $seed = isset($raw['seed']) ? self::int($raw, 'seed') : random_int(1, PHP_INT_MAX);
         $verbose = self::bool($raw, 'verbose');
 
+        $fpm = self::bool($raw, 'fpm');
+        $harnessJobIndex = isset($raw['harness-job-index']) ? max(0, self::int($raw, 'harness-job-index')) : null;
+        $port = self::int($raw, 'port', 0);
+
+        if ($fpm && $harnessJobIndex !== null && $port > 0) {
+            $port += $harnessJobIndex;
+        }
+
         return new self(
             mode: self::mode(self::string($raw, 'mode', 'normal')),
             php: self::string($raw, 'php', PHP_BINARY),
             client: self::client(self::string($raw, 'client', 'relay')),
             host: self::string($raw, 'host', '127.0.0.1'),
-            port: self::int($raw, 'port', 0),
+            port: $port,
             redisHost: self::string($raw, 'redis-host', '127.0.0.1'),
             redisPort: self::int($raw, 'redis-port', 6379),
             redisDb: self::int($raw, 'redis-db', 0),
@@ -101,6 +115,12 @@ final class Config
             replayFile: isset($raw['replay']) ? self::string($raw, 'replay') : null,
             rr: self::bool($raw, 'rr'),
             rrTraceDir: isset($raw['rr-trace-dir']) ? self::string($raw, 'rr-trace-dir') : null,
+            fpm: $fpm,
+            phpFpm: self::string($raw, 'php-fpm', 'php-fpm'),
+            nginx: self::string($raw, 'nginx', 'nginx'),
+            fpmConfStub: isset($raw['fpm-conf-stub']) ? self::readableFile(self::string($raw, 'fpm-conf-stub'), 'fpm-conf-stub') : null,
+            fpmPoolConfStub: isset($raw['fpm-pool-conf-stub']) ? self::readableFile(self::string($raw, 'fpm-pool-conf-stub'), 'fpm-pool-conf-stub') : null,
+            harnessJobIndex: $harnessJobIndex,
         );
     }
 
@@ -145,6 +165,12 @@ final class Config
             replayFile: $this->replayFile,
             rr: $this->rr,
             rrTraceDir: $this->rrTraceDir,
+            fpm: $this->fpm,
+            phpFpm: $this->phpFpm,
+            nginx: $this->nginx,
+            fpmConfStub: $this->fpmConfStub,
+            fpmPoolConfStub: $this->fpmPoolConfStub,
+            harnessJobIndex: $this->harnessJobIndex,
         );
     }
 
@@ -258,7 +284,29 @@ Server and client:
       PHP CLI-server port. Use 0 to pick a free port. Default: 0.
 
   --workers=N
-      PHP_CLI_SERVER_WORKERS value. Must be an integer >= 1. Default: 2.
+      PHP_CLI_SERVER_WORKERS value for CLI-server runs, or static php-fpm
+      worker count for --fpm runs. Must be an integer >= 1. Default: 2.
+
+  --fpm
+      Serve router.php through an ephemeral php-fpm pool and self-contained
+      nginx instance instead of PHP's built-in CLI server.
+
+  --php-fpm=PATH
+      php-fpm binary used by --fpm. Default: php-fpm.
+
+  --nginx=PATH
+      nginx binary used by --fpm. Default: nginx.
+
+  --fpm-conf-stub=PATH
+      Optional php-fpm global config settings appended to the generated
+      php-fpm.conf.
+
+  --fpm-pool-conf-stub=PATH
+      Optional php-fpm pool settings appended to the generated pool config.
+
+  --harness-job-index=N
+      Internal harness option. When --fpm and --port is nonzero, the effective
+      nginx port is --port plus this zero-based job index.
 
 Redis:
   --redis-host=HOST
@@ -496,6 +544,15 @@ HELP;
         }
 
         return $runId;
+    }
+
+    private static function readableFile(string $path, string $option): string
+    {
+        if (!is_file($path) || !is_readable($path)) {
+            throw new FuzzerException("Option --{$option} must point to a readable file");
+        }
+
+        return $path;
     }
 
     /**

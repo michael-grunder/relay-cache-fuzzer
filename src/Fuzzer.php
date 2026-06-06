@@ -237,11 +237,17 @@ final class StartupBlock
             ['section' => 'run', 'setting' => 'run_id', 'value' => $runId],
             ['section' => 'run', 'setting' => 'server', 'value' => "http://{$config->host}:{$config->port}"],
             ['section' => 'run', 'setting' => 'argv', 'value' => array_values(array_map('strval', $_SERVER['argv'] ?? []))],
+            ['section' => 'php_server', 'setting' => 'transport', 'value' => $config->fpm ? 'fpm' : 'cli'],
             ['section' => 'php_server', 'setting' => 'php', 'value' => $config->php],
+            ['section' => 'php_server', 'setting' => 'php_fpm', 'value' => $config->phpFpm],
+            ['section' => 'php_server', 'setting' => 'nginx', 'value' => $config->nginx],
             ['section' => 'php_server', 'setting' => 'host', 'value' => $config->host],
             ['section' => 'php_server', 'setting' => 'port', 'value' => $config->port],
             ['section' => 'php_server', 'setting' => 'workers', 'value' => $config->workers],
             ['section' => 'php_server', 'setting' => 'client', 'value' => $config->client],
+            ['section' => 'php_server', 'setting' => 'fpm_conf_stub', 'value' => $config->fpmConfStub],
+            ['section' => 'php_server', 'setting' => 'fpm_pool_conf_stub', 'value' => $config->fpmPoolConfStub],
+            ['section' => 'php_server', 'setting' => 'harness_job_index', 'value' => $config->harnessJobIndex],
             ['section' => 'php_server', 'setting' => 'request_timeout_ms', 'value' => $config->requestTimeoutMs],
             ['section' => 'php_server', 'setting' => 'watchdog_timeout_ms', 'value' => $config->watchdogTimeoutMs],
             ['section' => 'redis', 'setting' => 'host', 'value' => $config->redisHost],
@@ -805,19 +811,34 @@ final class HttpClient
 final class ServerProcess
 {
     private Process $process;
+    private ?Process $nginxProcess = null;
     private RingBuffer $stdout;
     private RingBuffer $stderr;
+    private string $runtimeDir;
 
     public function __construct(
         private readonly Config $config,
         private readonly LoggerInterface $logger,
         private readonly ?string $rrTraceDir = null,
+        ?string $runId = null,
     ) {
         $this->stdout = new RingBuffer(200);
         $this->stderr = new RingBuffer(200);
+        $safeRunId = preg_replace('/[^A-Za-z0-9_.:-]/', '-', $runId ?? bin2hex(random_bytes(6))) ?: bin2hex(random_bytes(6));
+        $this->runtimeDir = sys_get_temp_dir() . DIRECTORY_SEPARATOR . 'relay-cache-fuzzer-' . $safeRunId;
     }
 
     public function start(): void
+    {
+        if ($this->config->fpm) {
+            $this->startFpm();
+            return;
+        }
+
+        $this->startCliServer();
+    }
+
+    private function startCliServer(): void
     {
         $router = dirname(__DIR__) . '/router.php';
         $command = [
@@ -864,17 +885,182 @@ final class ServerProcess
         $this->logger->debug('server parent started', ['pid' => $this->process->getPid()]);
     }
 
+    private function startFpm(): void
+    {
+        $this->prepareFpmRuntimeDirectory();
+        $socketPath = $this->runtimeDir . DIRECTORY_SEPARATOR . 'php-fpm.sock';
+        $pidPath = $this->runtimeDir . DIRECTORY_SEPARATOR . 'php-fpm.pid';
+        $fpmConfig = $this->runtimeDir . DIRECTORY_SEPARATOR . 'php-fpm.conf';
+        $poolConfig = $this->runtimeDir . DIRECTORY_SEPARATOR . 'pool.conf';
+        $nginxConfig = $this->runtimeDir . DIRECTORY_SEPARATOR . 'nginx.conf';
+
+        $this->writeFpmConfig($fpmConfig, $poolConfig, $pidPath, $socketPath);
+        $this->writeNginxConfig($nginxConfig, $socketPath);
+
+        $env = [
+            'RELAY_FUZZ_CLIENT' => $this->config->client,
+            'RELAY_FUZZ_REDIS_HOST' => $this->config->redisHost,
+            'RELAY_FUZZ_REDIS_PORT' => (string) $this->config->redisPort,
+            'RELAY_FUZZ_REDIS_DB' => (string) $this->config->redisDb,
+        ];
+        $command = [
+            $this->config->phpFpm,
+            '-F',
+            '-y', $fpmConfig,
+            '-d', 'relay.max_endpoint_dbs=' . $this->config->relayMaxEndpointDbs,
+            '-d', 'relay.max_db_writers=' . $this->config->relayMaxDbWriters,
+            '-d', 'relay.cache=1',
+        ];
+
+        $this->process = new Process($command, dirname(__DIR__), $env);
+        $this->process->setTimeout(null);
+        $this->logger->info('starting php-fpm', [
+            'workers' => $this->config->workers,
+            'socket' => $socketPath,
+            'runtime_dir' => $this->runtimeDir,
+            'client' => $this->config->client,
+        ]);
+        $this->logger->debug('php-fpm command line', ['command' => $this->process->getCommandLine()]);
+        $this->process->start();
+
+        $nginxCommand = [$this->config->nginx, '-p', $this->runtimeDir, '-c', $nginxConfig, '-g', 'daemon off;'];
+        $this->nginxProcess = new Process($nginxCommand, dirname(__DIR__));
+        $this->nginxProcess->setTimeout(null);
+        $this->logger->info('starting nginx', [
+            'host' => $this->config->host,
+            'port' => $this->config->port,
+            'runtime_dir' => $this->runtimeDir,
+        ]);
+        $this->logger->debug('nginx command line', ['command' => $this->nginxProcess->getCommandLine()]);
+        $this->nginxProcess->start();
+    }
+
+    private function prepareFpmRuntimeDirectory(): void
+    {
+        if (!is_dir($this->runtimeDir) && !mkdir($this->runtimeDir, 0777, true) && !is_dir($this->runtimeDir)) {
+            throw new FuzzerException("Could not create FPM runtime directory {$this->runtimeDir}");
+        }
+
+        foreach (['logs', 'client-body'] as $dir) {
+            $path = $this->runtimeDir . DIRECTORY_SEPARATOR . $dir;
+
+            if (!is_dir($path) && !mkdir($path, 0777, true) && !is_dir($path)) {
+                throw new FuzzerException("Could not create FPM runtime subdirectory {$path}");
+            }
+        }
+    }
+
+    private function writeFpmConfig(string $fpmConfig, string $poolConfig, string $pidPath, string $socketPath): void
+    {
+        $globalStub = $this->config->fpmConfStub === null ? '' : trim((string) file_get_contents($this->config->fpmConfStub));
+        $poolStub = $this->config->fpmPoolConfStub === null ? '' : trim((string) file_get_contents($this->config->fpmPoolConfStub));
+        $globalExtra = $globalStub === '' ? '' : "\n; user fpm-conf-stub\n{$globalStub}\n";
+        $poolExtra = $poolStub === '' ? '' : "\n; user fpm-pool-conf-stub\n{$poolStub}\n";
+
+        $global = <<<CONF
+[global]
+pid = {$pidPath}
+error_log = {$this->runtimeDir}/logs/php-fpm-error.log
+log_level = notice
+daemonize = no
+{$globalExtra}
+include = {$poolConfig}
+
+CONF;
+        $pool = <<<CONF
+[relay_fuzz]
+listen = {$socketPath}
+listen.mode = 0666
+pm = static
+pm.max_children = {$this->config->workers}
+catch_workers_output = yes
+clear_env = no
+env[RELAY_FUZZ_CLIENT] = {$this->config->client}
+env[RELAY_FUZZ_REDIS_HOST] = {$this->config->redisHost}
+env[RELAY_FUZZ_REDIS_PORT] = {$this->config->redisPort}
+env[RELAY_FUZZ_REDIS_DB] = {$this->config->redisDb}
+{$poolExtra}
+
+CONF;
+
+        file_put_contents($fpmConfig, $global);
+        file_put_contents($poolConfig, $pool);
+    }
+
+    private function writeNginxConfig(string $nginxConfig, string $socketPath): void
+    {
+        $router = dirname(__DIR__) . '/router.php';
+        $root = dirname(__DIR__);
+        $host = $this->config->host;
+        $port = $this->config->port;
+
+        $config = <<<CONF
+worker_processes 1;
+pid {$this->runtimeDir}/nginx.pid;
+error_log {$this->runtimeDir}/logs/nginx-error.log info;
+
+events {
+    worker_connections 128;
+}
+
+http {
+    access_log {$this->runtimeDir}/logs/nginx-access.log;
+    client_body_temp_path {$this->runtimeDir}/client-body;
+
+    server {
+        listen {$host}:{$port};
+        server_name relay-cache-fuzzer;
+        root {$root};
+
+        location / {
+            fastcgi_pass unix:{$socketPath};
+            fastcgi_param GATEWAY_INTERFACE CGI/1.1;
+            fastcgi_param SERVER_SOFTWARE nginx;
+            fastcgi_param REMOTE_ADDR \$remote_addr;
+            fastcgi_param REMOTE_PORT \$remote_port;
+            fastcgi_param SERVER_ADDR \$server_addr;
+            fastcgi_param SERVER_PORT \$server_port;
+            fastcgi_param SERVER_NAME \$server_name;
+            fastcgi_param SERVER_PROTOCOL \$server_protocol;
+            fastcgi_param SCRIPT_FILENAME {$router};
+            fastcgi_param SCRIPT_NAME /router.php;
+            fastcgi_param DOCUMENT_ROOT {$root};
+            fastcgi_param REQUEST_URI \$request_uri;
+            fastcgi_param QUERY_STRING \$query_string;
+            fastcgi_param REQUEST_METHOD \$request_method;
+            fastcgi_param CONTENT_TYPE \$content_type;
+            fastcgi_param CONTENT_LENGTH \$content_length;
+        }
+    }
+}
+
+CONF;
+
+        file_put_contents($nginxConfig, $config);
+    }
+
     public function drain(): void
     {
-        $this->pushLines($this->stdout, $this->process->getIncrementalOutput(), 'stdout');
-        $this->pushLines($this->stderr, $this->process->getIncrementalErrorOutput(), 'stderr');
+        if (isset($this->process)) {
+            $this->pushLines($this->stdout, $this->process->getIncrementalOutput(), $this->config->fpm ? 'php-fpm stdout' : 'stdout');
+            $this->pushLines($this->stderr, $this->process->getIncrementalErrorOutput(), $this->config->fpm ? 'php-fpm stderr' : 'stderr');
+        }
+
+        if ($this->nginxProcess instanceof Process) {
+            $this->pushLines($this->stdout, $this->nginxProcess->getIncrementalOutput(), 'nginx stdout');
+            $this->pushLines($this->stderr, $this->nginxProcess->getIncrementalErrorOutput(), 'nginx stderr');
+        }
     }
 
     public function isRunning(): bool
     {
         $this->drain();
 
-        return $this->process->isRunning();
+        if (!$this->process->isRunning()) {
+            return false;
+        }
+
+        return !$this->nginxProcess instanceof Process || $this->nginxProcess->isRunning();
     }
 
     public function parentPid(): ?int
@@ -884,6 +1070,10 @@ final class ServerProcess
 
     public function commandLine(): string
     {
+        if ($this->nginxProcess instanceof Process) {
+            return 'php-fpm: ' . $this->process->getCommandLine() . "\nnginx: " . $this->nginxProcess->getCommandLine();
+        }
+
         return $this->process->getCommandLine();
     }
 
@@ -903,10 +1093,19 @@ final class ServerProcess
     public function stop(): bool
     {
         if (!isset($this->process) || !$this->process->isRunning()) {
+            if ($this->nginxProcess instanceof Process && $this->nginxProcess->isRunning()) {
+                $this->nginxProcess->stop(0.0, 15);
+            }
+
             return true;
         }
 
-        $this->logger->info('stopping PHP CLI server', ['parent_pid' => $this->process->getPid()]);
+        if ($this->nginxProcess instanceof Process && $this->nginxProcess->isRunning()) {
+            $this->logger->info('stopping nginx', ['pid' => $this->nginxProcess->getPid()]);
+            $this->nginxProcess->stop(1.0, 15);
+        }
+
+        $this->logger->info($this->config->fpm ? 'stopping php-fpm' : 'stopping PHP CLI server', ['parent_pid' => $this->process->getPid()]);
 
         try {
             $this->process->signal(15);
@@ -925,7 +1124,7 @@ final class ServerProcess
             return true;
         }
 
-        $this->logger->warning('PHP CLI server did not stop after SIGTERM', ['parent_pid' => $this->process->getPid()]);
+        $this->logger->warning($this->config->fpm ? 'php-fpm did not stop after SIGTERM' : 'PHP CLI server did not stop after SIGTERM', ['parent_pid' => $this->process->getPid()]);
         $this->process->stop(0.0, 15);
 
         return false;
@@ -977,6 +1176,76 @@ final class ServerProcess
             'stdout' => implode("\n", array_map('strval', $tails['stdout'])) . ($tails['stdout'] === [] ? '' : "\n"),
             'stderr' => implode("\n", array_map('strval', $tails['stderr'])) . ($tails['stderr'] === [] ? '' : "\n"),
         ];
+    }
+
+    public function runtimeDirectory(): ?string
+    {
+        return $this->config->fpm ? $this->runtimeDir : null;
+    }
+
+    public function cleanupRuntimeDirectory(): void
+    {
+        if (!$this->config->fpm || $this->config->keepTemp || !is_dir($this->runtimeDir)) {
+            return;
+        }
+
+        self::removeTree($this->runtimeDir);
+    }
+
+    public function copyRuntimeDirectory(string $destination): void
+    {
+        if (!$this->config->fpm || !is_dir($this->runtimeDir)) {
+            return;
+        }
+
+        self::copyTree($this->runtimeDir, $destination);
+    }
+
+    private static function copyTree(string $source, string $destination): void
+    {
+        if (!is_dir($destination) && !mkdir($destination, 0777, true) && !is_dir($destination)) {
+            throw new FuzzerException("Could not create runtime bundle directory {$destination}");
+        }
+
+        $iterator = new RecursiveIteratorIterator(
+            new RecursiveDirectoryIterator($source, RecursiveDirectoryIterator::SKIP_DOTS),
+            RecursiveIteratorIterator::SELF_FIRST,
+        );
+
+        foreach ($iterator as $item) {
+            $target = $destination . DIRECTORY_SEPARATOR . $iterator->getSubPathName();
+
+            if ($item->isDir()) {
+                if (!is_dir($target) && !mkdir($target, 0777, true) && !is_dir($target)) {
+                    throw new FuzzerException("Could not create runtime bundle directory {$target}");
+                }
+
+                continue;
+            }
+
+            if ($item->isFile() && !copy($item->getPathname(), $target)) {
+                throw new FuzzerException("Could not copy runtime file {$item->getPathname()}");
+            }
+        }
+    }
+
+    private static function removeTree(string $path): void
+    {
+        $iterator = new RecursiveIteratorIterator(
+            new RecursiveDirectoryIterator($path, RecursiveDirectoryIterator::SKIP_DOTS),
+            RecursiveIteratorIterator::CHILD_FIRST,
+        );
+
+        foreach ($iterator as $item) {
+            if ($item->isDir()) {
+                rmdir($item->getPathname());
+                continue;
+            }
+
+            unlink($item->getPathname());
+        }
+
+        rmdir($path);
     }
 
     private function pushLines(RingBuffer $buffer, string $chunk, string $stream = 'server'): void
@@ -1084,7 +1353,7 @@ final class Fuzzer
         $this->logger->debug('Redis ping succeeded');
 
         $this->http = new HttpClient($this->config->host, $this->config->port, $this->config->requestTimeoutMs);
-        $this->server = new ServerProcess($this->config, $this->logger);
+        $this->server = new ServerProcess($this->config, $this->logger, runId: $this->runId);
 
         try {
             $this->server->start();
@@ -1105,6 +1374,8 @@ final class Fuzzer
 
             $this->cleanupRedisKeys();
             $this->server->drain();
+            $this->server->stop();
+            $this->server->cleanupRuntimeDirectory();
             $this->logger->info('completed fuzz run', [
                 'iterations' => $this->stats['iterations'],
                 'requests' => $this->stats['total_requests'],
@@ -1701,11 +1972,13 @@ final class Fuzzer
             ],
             'run_id' => $this->runId,
             'server' => [
+                'transport' => $this->config->fpm ? 'fpm' : 'cli',
                 'host' => $this->config->host,
                 'port' => $this->config->port,
                 'parent_pid' => $this->server->parentPid(),
                 'command_line' => $this->server->commandLine(),
                 'output' => $this->server->tails(),
+                'runtime_dir' => $this->server->runtimeDirectory(),
             ],
             'redis' => [
                 'host' => $this->config->redisHost,
@@ -1731,9 +2004,10 @@ final class Fuzzer
         ];
 
         file_put_contents($path, json_encode($payload, JSON_PRETTY_PRINT | JSON_THROW_ON_ERROR) . "\n");
-        $this->logger->error('wrote failure reproducer', ['path' => $path, 'reason' => $reason]);
+        $this->server->copyRuntimeDirectory($bundlePath . DIRECTORY_SEPARATOR . 'server-runtime');
+        $this->logger->error('wrote failure reproducer', ['path' => $bundlePath, 'reason' => $reason]);
 
-        return $path;
+        return $bundlePath;
     }
 
     private static function pickFreePort(string $host): int
@@ -1857,7 +2131,7 @@ final class SequentialFuzzer
         $this->redis->ping();
 
         $this->http = new HttpClient($this->config->host, $this->config->port, $this->config->requestTimeoutMs);
-        $this->server = new ServerProcess($this->config, $this->logger, $this->rrTraceDir);
+        $this->server = new ServerProcess($this->config, $this->logger, $this->rrTraceDir, $this->runId);
 
         try {
             $this->server->start();
@@ -1867,6 +2141,8 @@ final class SequentialFuzzer
             $this->shutdownLoop();
             $this->finalWorkerPhase();
             $this->cleanupRedisKeys();
+            $this->server->stop();
+            $this->server->cleanupRuntimeDirectory();
             $this->cleanupTempTrace();
 
             $this->logger->info('completed sequential fuzz run', [
@@ -2546,7 +2822,9 @@ final class SequentialFuzzer
             'argv' => array_values(array_map('strval', $_SERVER['argv'] ?? [])),
             'php' => $this->config->php,
             'client' => $this->config->client,
+            'server_transport' => $this->config->fpm ? 'fpm' : 'cli',
             'command_line' => $commandLine,
+            'runtime_dir' => $this->server->runtimeDirectory(),
             'relay_ini' => [
                 'relay.max_endpoint_dbs' => $this->config->relayMaxEndpointDbs,
                 'relay.max_db_writers' => $this->config->relayMaxDbWriters,
@@ -2591,6 +2869,7 @@ final class SequentialFuzzer
         file_put_contents($path . '/events.log', implode("\n", $this->eventLines) . ($this->eventLines === [] ? '' : "\n"));
         file_put_contents($path . '/server.stdout', $output['stdout']);
         file_put_contents($path . '/server.stderr', $output['stderr']);
+        $this->server->copyRuntimeDirectory($path . '/server-runtime');
 
         if ($this->config->rr && $this->rrTraceDir !== null) {
             $this->preserveRrTrace($path . '/rr');
@@ -2837,7 +3116,7 @@ final class SimpleSequentialFuzzer
         $this->initializeKeyspace();
 
         $this->http = new HttpClient($this->config->host, $this->config->port, $this->config->requestTimeoutMs);
-        $this->server = new ServerProcess($this->config, $this->logger, $this->rrTraceDir);
+        $this->server = new ServerProcess($this->config, $this->logger, $this->rrTraceDir, $this->runId);
 
         try {
             $this->server->start();
@@ -2847,6 +3126,7 @@ final class SimpleSequentialFuzzer
             $this->shutdownLoop();
             $this->cleanupRedisKeys();
             $this->server->stop();
+            $this->server->cleanupRuntimeDirectory();
             $this->cleanupTempTrace();
 
             $this->logger->info('completed simple sequential fuzz run', [
@@ -3399,7 +3679,9 @@ final class SimpleSequentialFuzzer
             'argv' => array_values(array_map('strval', $_SERVER['argv'] ?? [])),
             'php' => $this->config->php,
             'client' => $this->config->client,
+            'server_transport' => $this->config->fpm ? 'fpm' : 'cli',
             'command_line' => $commandLine,
+            'runtime_dir' => $this->server->runtimeDirectory(),
             'relay_ini' => [
                 'relay.max_endpoint_dbs' => $this->config->relayMaxEndpointDbs,
                 'relay.max_db_writers' => $this->config->relayMaxDbWriters,
@@ -3447,6 +3729,7 @@ final class SimpleSequentialFuzzer
         file_put_contents($path . '/events.log', implode("\n", $this->eventLines) . ($this->eventLines === [] ? '' : "\n"));
         file_put_contents($path . '/server.stdout', $output['stdout']);
         file_put_contents($path . '/server.stderr', $output['stderr']);
+        $this->server->copyRuntimeDirectory($path . '/server-runtime');
 
         if ($this->config->rr && $this->rrTraceDir !== null) {
             $this->preserveRrTrace($path . '/rr');
@@ -3629,7 +3912,7 @@ final class ReplayRunner
             $this->config->requestTimeoutMs,
         );
         $this->http = new HttpClient($this->config->host, $this->config->port, $this->config->requestTimeoutMs);
-        $this->server = new ServerProcess($this->config, $this->logger);
+        $this->server = new ServerProcess($this->config, $this->logger, runId: 'replay-' . bin2hex(random_bytes(3)));
 
         try {
             $this->server->start();
