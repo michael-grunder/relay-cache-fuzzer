@@ -71,6 +71,37 @@ bin/harness \
     --commands-per-worker='{{COMMANDS=10000}}'
 ```
 
+Capture rr traces during a reduced sequential campaign:
+
+```bash
+bin/harness \
+  --jobs=46 \
+  --work-dir="$PWD" \
+  --reduce \
+  --tui \
+  -- \
+  bin/relay-cache-fuzzer \
+    --mode=simple-sequential \
+    --rr \
+    --rr-trace-dir="$PWD/artifacts/rr" \
+    --keys=10 \
+    --client=relay \
+    --php=/home/mike/dev/phpfarm/src/php-8.5.0-debug/sapi/cli/php \
+    --commands-per-worker='{{COMMANDS=100}}' \
+    --workers=4 \
+    --keys-per-worker=4 \
+    --delay-us=10000 \
+    --verify-retries=8 \
+    --verify-delay-us=10000 \
+    --relay-max-endpoint-dbs=1 \
+    --relay-max-db-writers=4
+```
+
+The harness passes `--rr` through to the fuzzer. The fuzzer runs the PHP CLI
+server under `rr record`, writes each run below the configured trace root, and
+copies finalized traces for failing sequential runs into the harness failure
+artifact at `artifacts/failures/000001/reproducer/rr/`.
+
 Run a longer capacity-pressure test:
 
 ```bash
