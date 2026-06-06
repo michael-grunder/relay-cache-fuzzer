@@ -32,9 +32,9 @@ final class RequestException extends RuntimeException
 
 final class ReproducerPaths
 {
-    public static function createBundleDirectory(string $mode): string
+    public static function createBundleDirectory(string $mode, string $type): string
     {
-        $root = getcwd() . DIRECTORY_SEPARATOR . 'reproducers' . DIRECTORY_SEPARATOR . $mode;
+        $root = getcwd() . DIRECTORY_SEPARATOR . 'reproducers' . DIRECTORY_SEPARATOR . $mode . DIRECTORY_SEPARATOR . $type;
 
         if (!is_dir($root) && !mkdir($root, 0777, true) && !is_dir($root)) {
             throw new FuzzerException("Could not create reproducer root {$root}");
@@ -55,6 +55,43 @@ final class ReproducerPaths
         }
 
         throw new FuzzerException("Could not allocate reproducer bundle under {$root}");
+    }
+}
+
+final class ReproducerTypes
+{
+    public const STALE_KEY = 'stale_key';
+    public const CRASH = 'crash';
+    public const STUCK = 'stuck';
+    public const OTHER = 'other';
+
+    /**
+     * @param array<string, mixed> $context
+     * @param array<string, int> $stats
+     */
+    public static function classify(string $reason, array $context, array $stats, ?ServerProcess $server, bool $serverStopTimedOut): string
+    {
+        if (($stats['stale_observations'] ?? 0) > 0) {
+            return self::STALE_KEY;
+        }
+
+        if ($serverStopTimedOut) {
+            return self::STUCK;
+        }
+
+        if ($server?->crashingSignalName() !== null) {
+            return self::CRASH;
+        }
+
+        return self::OTHER;
+    }
+
+    /**
+     * @param array<string, true> $captureTypes
+     */
+    public static function shouldCapture(array $captureTypes, string $type): bool
+    {
+        return isset($captureTypes[$type]);
     }
 }
 
@@ -863,12 +900,70 @@ final class ServerProcess
         ];
     }
 
-    public function stop(): void
+    public function stop(): bool
     {
-        if (isset($this->process) && $this->process->isRunning()) {
-            $this->logger->info('stopping PHP CLI server', ['parent_pid' => $this->process->getPid()]);
-            $this->process->stop(1.0, 15);
+        if (!isset($this->process) || !$this->process->isRunning()) {
+            return true;
         }
+
+        $this->logger->info('stopping PHP CLI server', ['parent_pid' => $this->process->getPid()]);
+
+        try {
+            $this->process->signal(15);
+        } catch (Throwable) {
+            return true;
+        }
+
+        $deadline = microtime(true) + 1.0;
+
+        while ($this->process->isRunning() && microtime(true) < $deadline) {
+            $this->drain();
+            usleep(1000);
+        }
+
+        if (!$this->process->isRunning()) {
+            return true;
+        }
+
+        $this->logger->warning('PHP CLI server did not stop after SIGTERM', ['parent_pid' => $this->process->getPid()]);
+        $this->process->stop(0.0, 15);
+
+        return false;
+    }
+
+    public function crashingSignalName(): ?string
+    {
+        if (!isset($this->process) || !$this->process->isTerminated()) {
+            return null;
+        }
+
+        try {
+            if ($this->process->hasBeenSignaled()) {
+                return self::crashingSignalNameForNumber($this->process->getTermSignal());
+            }
+        } catch (Throwable) {
+            return null;
+        }
+
+        $exitCode = $this->process->getExitCode();
+
+        if ($exitCode !== null && $exitCode >= 128) {
+            return self::crashingSignalNameForNumber($exitCode - 128);
+        }
+
+        return null;
+    }
+
+    private static function crashingSignalNameForNumber(int $signal): ?string
+    {
+        return match ($signal) {
+            4 => 'SIGILL',
+            6 => 'SIGABRT',
+            7 => 'SIGBUS',
+            8 => 'SIGFPE',
+            11 => 'SIGSEGV',
+            default => null,
+        };
     }
 
     /**
@@ -905,6 +1000,7 @@ final class Fuzzer
     private LoggerInterface $logger;
     private string $runId;
     private ?string $failurePath = null;
+    private ?string $failureType = null;
     private float $lastSuccessAt;
 
     /** @var array<int, true> */
@@ -1016,9 +1112,16 @@ final class Fuzzer
                 'stale_observations' => $this->stats['stale_observations'],
             ]);
         } catch (Throwable $e) {
-            $path = $this->failurePath ?? $this->writeReproducer('exception', ['message' => $e->getMessage()]);
-            $this->logger->error('fuzz run failed', ['error' => $e->getMessage(), 'reproducer' => $path]);
-            throw new FuzzerException($e->getMessage() . "\nreproducer={$path}", previous: $e);
+            $path = $this->failurePath ?? $this->maybeWriteReproducer('exception', ['message' => $e->getMessage()]);
+            $type = $this->failureType ?? ReproducerTypes::OTHER;
+
+            if ($path !== null) {
+                $this->logger->error('fuzz run failed', ['error' => $e->getMessage(), 'reproducer_type' => $type, 'reproducer' => $path]);
+                throw new FuzzerException($e->getMessage() . "\nreproducer_type={$type}\nreproducer={$path}", previous: $e);
+            }
+
+            $this->logger->error('fuzz run failed without captured reproducer', ['error' => $e->getMessage(), 'reproducer_type' => $type]);
+            throw new FuzzerException($e->getMessage() . "\nreproducer_type={$type}", previous: $e);
         } finally {
             $this->server->stop();
         }
@@ -1553,20 +1656,37 @@ final class Fuzzer
     private function abort(string $message, array $context = []): never
     {
         $this->logger->error('aborting fuzz run', ['reason' => $message, 'context' => $context]);
-        $this->failurePath = $this->writeReproducer($message, $context);
+        $this->failurePath = $this->maybeWriteReproducer($message, $context);
 
-        throw new FuzzerException("{$message}\nreproducer={$this->failurePath}");
+        throw new FuzzerException($message);
     }
 
     /**
      * @param array<string, mixed> $context
      */
-    private function writeReproducer(string $reason, array $context): string
+    private function maybeWriteReproducer(string $reason, array $context): ?string
+    {
+        $type = ReproducerTypes::classify($reason, $context, $this->stats, $this->server, false);
+        $this->failureType = $type;
+
+        if (!ReproducerTypes::shouldCapture($this->config->captureTypes, $type)) {
+            $this->logger->warning('skipping reproducer capture for filtered type', ['type' => $type, 'reason' => $reason]);
+            return null;
+        }
+
+        return $this->writeReproducer($type, $reason, $context);
+    }
+
+    /**
+     * @param array<string, mixed> $context
+     */
+    private function writeReproducer(string $type, string $reason, array $context): string
     {
         $this->server->drain();
-        $bundlePath = ReproducerPaths::createBundleDirectory('random');
+        $bundlePath = ReproducerPaths::createBundleDirectory('random', $type);
         $path = $bundlePath . DIRECTORY_SEPARATOR . 'reproducer.json';
         $payload = [
+            'reproducer_type' => $type,
             'reason' => $reason,
             'context' => $context,
             'seed' => $this->config->seed,
@@ -1754,12 +1874,19 @@ final class SequentialFuzzer
                 'stale_observations' => $this->stats['stale_observations'],
             ]);
         } catch (Throwable $e) {
-            $this->server->stop();
+            $serverStopTimedOut = !$this->server->stop();
+            $context = $this->failureContext ?? [];
+            $type = ReproducerTypes::classify($e->getMessage(), $context, $this->stats, $this->server, $serverStopTimedOut);
 
-            $path = $this->writeBundle($e->getMessage(), $this->failureContext ?? [], $e);
-            $this->logger->error('sequential fuzz run failed', ['error' => $e->getMessage(), 'reproducer' => $path]);
+            if (!ReproducerTypes::shouldCapture($this->config->captureTypes, $type)) {
+                $this->logger->error('sequential fuzz run failed without captured reproducer', ['error' => $e->getMessage(), 'reproducer_type' => $type]);
+                throw new FuzzerException($e->getMessage() . "\nreproducer_type={$type}", previous: $e);
+            }
 
-            throw new FuzzerException($e->getMessage() . "\nreproducer={$path}", previous: $e);
+            $path = $this->writeBundle($type, $e->getMessage(), $context, $e);
+            $this->logger->error('sequential fuzz run failed', ['error' => $e->getMessage(), 'reproducer_type' => $type, 'reproducer' => $path]);
+
+            throw new FuzzerException($e->getMessage() . "\nreproducer_type={$type}\nreproducer={$path}", previous: $e);
         } finally {
             $this->server->stop();
         }
@@ -2405,11 +2532,11 @@ final class SequentialFuzzer
     /**
      * @param array<string, mixed> $context
      */
-    private function writeBundle(string $reason, array $context, Throwable $throwable): string
+    private function writeBundle(string $type, string $reason, array $context, Throwable $throwable): string
     {
         $this->server->drain();
 
-        $path = ReproducerPaths::createBundleDirectory('sequential');
+        $path = ReproducerPaths::createBundleDirectory('sequential', $type);
 
         $commandLine = $this->server->commandLine();
         $output = $this->server->outputText();
@@ -2440,6 +2567,7 @@ final class SequentialFuzzer
             'rr_trace_dir' => $this->rrTraceDir,
         ];
         $reproducer = [
+            'reproducer_type' => $type,
             'reason' => $reason,
             'exception' => $throwable::class,
             'message' => $throwable->getMessage(),
@@ -2727,12 +2855,19 @@ final class SimpleSequentialFuzzer
                 'stale_observations' => $this->stats['stale_observations'],
             ]);
         } catch (Throwable $e) {
-            $this->server->stop();
+            $serverStopTimedOut = !$this->server->stop();
+            $context = $this->failureContext ?? [];
+            $type = ReproducerTypes::classify($e->getMessage(), $context, $this->stats, $this->server, $serverStopTimedOut);
 
-            $path = $this->writeBundle($e->getMessage(), $this->failureContext ?? [], $e);
-            $this->logger->error('simple sequential fuzz run failed', ['error' => $e->getMessage(), 'reproducer' => $path]);
+            if (!ReproducerTypes::shouldCapture($this->config->captureTypes, $type)) {
+                $this->logger->error('simple sequential fuzz run failed without captured reproducer', ['error' => $e->getMessage(), 'reproducer_type' => $type]);
+                throw new FuzzerException($e->getMessage() . "\nreproducer_type={$type}", previous: $e);
+            }
 
-            throw new FuzzerException($e->getMessage() . "\nreproducer={$path}", previous: $e);
+            $path = $this->writeBundle($type, $e->getMessage(), $context, $e);
+            $this->logger->error('simple sequential fuzz run failed', ['error' => $e->getMessage(), 'reproducer_type' => $type, 'reproducer' => $path]);
+
+            throw new FuzzerException($e->getMessage() . "\nreproducer_type={$type}\nreproducer={$path}", previous: $e);
         } finally {
             $this->server->stop();
         }
@@ -3250,11 +3385,11 @@ final class SimpleSequentialFuzzer
     /**
      * @param array<string, mixed> $context
      */
-    private function writeBundle(string $reason, array $context, Throwable $throwable): string
+    private function writeBundle(string $type, string $reason, array $context, Throwable $throwable): string
     {
         $this->server->drain();
 
-        $path = ReproducerPaths::createBundleDirectory('simple-sequential');
+        $path = ReproducerPaths::createBundleDirectory('simple-sequential', $type);
 
         $commandLine = $this->server->commandLine();
         $output = $this->server->outputText();
@@ -3286,6 +3421,7 @@ final class SimpleSequentialFuzzer
             'rr_trace_dir' => $this->rrTraceDir,
         ];
         $reproducer = [
+            'reproducer_type' => $type,
             'reason' => $reason,
             'exception' => $throwable::class,
             'message' => $throwable->getMessage(),

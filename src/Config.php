@@ -9,6 +9,7 @@ final class Config
     /**
      * @param array<int, int> $signalWeights
      * @param list<int> $signals
+     * @param array<string, true> $captureTypes
      */
     private function __construct(
         public readonly string $mode,
@@ -45,6 +46,7 @@ final class Config
         public readonly bool $keyspaceIsolated,
         public readonly array $signalWeights,
         public readonly array $signals,
+        public readonly array $captureTypes,
         public readonly ?string $replayFile,
         public readonly bool $rr,
         public readonly ?string $rrTraceDir,
@@ -95,6 +97,7 @@ final class Config
             keyspaceIsolated: self::bool($raw, 'keyspace-isolated'),
             signalWeights: self::parseSignalMix(self::string($raw, 'signal-mix', 'TERM:60,INT:20,KILL:20')),
             signals: self::parseSignals(self::string($raw, 'signals', 'SIGINT,SIGTERM,SIGQUIT')),
+            captureTypes: self::parseCaptureTypes(self::string($raw, 'capture', 'stale_key')),
             replayFile: isset($raw['replay']) ? self::string($raw, 'replay') : null,
             rr: self::bool($raw, 'rr'),
             rrTraceDir: isset($raw['rr-trace-dir']) ? self::string($raw, 'rr-trace-dir') : null,
@@ -138,6 +141,7 @@ final class Config
             keyspaceIsolated: $this->keyspaceIsolated,
             signalWeights: $this->signalWeights,
             signals: $this->signals,
+            captureTypes: $this->captureTypes,
             replayFile: $this->replayFile,
             rr: $this->rr,
             rrTraceDir: $this->rrTraceDir,
@@ -364,6 +368,13 @@ Logging and diagnostics:
       Avoid global Redis keyspace mutations such as FLUSHDB in modes that can
       otherwise use them. This is intended for harness-launched parallel runs.
 
+  --capture=stale_key,crash,stuck,other
+      Comma-separated reproducer types to capture. Default: stale_key.
+      Use all to capture every type. stale_key means Relay returned an old key
+      value, crash means the PHP server exited due to a crashing signal, stuck
+      means the PHP server did not stop after a normal termination signal, and
+      other covers request failures and uncategorized fuzzer failures.
+
 Replay and rr:
   --replay=PATH
       Replay a randomized reproducer JSON file. The replay is best-effort
@@ -554,5 +565,38 @@ HELP;
         }
 
         return array_values(array_unique($signals));
+    }
+
+    /**
+     * @return array<string, true>
+     */
+    private static function parseCaptureTypes(string $list): array
+    {
+        $supported = ['stale_key' => true, 'crash' => true, 'stuck' => true, 'other' => true];
+        $types = [];
+
+        foreach (explode(',', $list) as $part) {
+            $type = strtolower(trim($part));
+
+            if ($type === '') {
+                continue;
+            }
+
+            if ($type === 'all') {
+                return $supported;
+            }
+
+            if (!isset($supported[$type])) {
+                throw new FuzzerException('--capture must contain only stale_key, crash, stuck, other, or all');
+            }
+
+            $types[$type] = true;
+        }
+
+        if ($types === []) {
+            throw new FuzzerException('--capture must contain at least one type');
+        }
+
+        return $types;
     }
 }

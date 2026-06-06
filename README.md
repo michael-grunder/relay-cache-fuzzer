@@ -213,10 +213,14 @@ bin/relay-cache-fuzzer --help
 
 ## Failures And Diagnostics
 
+By default, the fuzzer captures only `stale_key` reproducers. Use
+`--capture=stale_key,crash,stuck,other` or `--capture=all` to include other
+failure classes.
+
 On randomized-mode failure, the fuzzer writes a JSON reproducer file named like:
 
 ```text
-reproducers/random/00001/reproducer.json
+reproducers/random/stale_key/00001/reproducer.json
 ```
 
 The file includes:
@@ -239,7 +243,7 @@ and server output.
 Sequential-mode failures write a reproducer directory named like:
 
 ```text
-reproducers/sequential/00001/
+reproducers/sequential/stale_key/00001/
 ```
 
 The bundle contains `startup.json`, `reproducer.json`, `events.log`,
