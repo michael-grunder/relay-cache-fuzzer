@@ -95,6 +95,273 @@ final class ReproducerTypes
     }
 }
 
+final class StaleSequenceLog
+{
+    /**
+     * @param list<array<string, mixed>> $events
+     * @param array<string, mixed> $context
+     * @return list<string>
+     */
+    public static function lines(array $events, array $context): array
+    {
+        $key = self::failureKey($context);
+        $selected = self::selectEvents($events, $key);
+
+        if ($selected === []) {
+            return [];
+        }
+
+        $start = self::eventTime($selected[0]) ?? 0.0;
+        $lastMutationAt = null;
+        $lines = [];
+
+        foreach ($selected as $event) {
+            $time = self::eventTime($event);
+
+            if (self::isMutation($event)) {
+                $lastMutationAt = $time;
+            }
+
+            $line = self::formatEvent($event, $start, $lastMutationAt);
+
+            if ($line !== null) {
+                $lines[] = $line;
+            }
+        }
+
+        return $lines;
+    }
+
+    /**
+     * @param array<string, mixed> $context
+     */
+    private static function failureKey(array $context): ?string
+    {
+        if (isset($context['key']) && is_string($context['key'])) {
+            return $context['key'];
+        }
+
+        if (isset($context['last_mismatch']) && is_array($context['last_mismatch'])) {
+            $key = $context['last_mismatch']['key'] ?? null;
+
+            if (is_string($key)) {
+                return $key;
+            }
+        }
+
+        return null;
+    }
+
+    /**
+     * @param list<array<string, mixed>> $events
+     * @return list<array<string, mixed>>
+     */
+    private static function selectEvents(array $events, ?string $key): array
+    {
+        if ($events === []) {
+            return [];
+        }
+
+        if ($key === null) {
+            return array_slice($events, -80);
+        }
+
+        $failureIndex = null;
+        $mutationIndex = null;
+        $readBeforeMutationIndex = null;
+
+        foreach ($events as $index => $event) {
+            if (self::isRead($event) && ($event['key'] ?? null) === $key && ($event['value'] ?? null) !== ($event['expected'] ?? null)) {
+                $failureIndex = $index;
+            }
+        }
+
+        $end = $failureIndex ?? array_key_last($events);
+
+        for ($index = $end; $index >= 0; $index--) {
+            if (self::isMutationForKey($events[$index], $key)) {
+                $mutationIndex = $index;
+                break;
+            }
+        }
+
+        if ($mutationIndex !== null) {
+            for ($index = $mutationIndex - 1; $index >= 0; $index--) {
+                if (self::isRead($events[$index]) && ($events[$index]['key'] ?? null) === $key) {
+                    $readBeforeMutationIndex = $index;
+                    break;
+                }
+            }
+        }
+
+        $start = $readBeforeMutationIndex ?? $mutationIndex ?? max(0, $end - 40);
+        $selected = [];
+
+        for ($index = $start; $index <= $end; $index++) {
+            $event = $events[$index];
+
+            if (
+                self::isRead($event) && ($event['key'] ?? null) === $key
+                || self::isMutationForKey($event, $key)
+                || self::isWorkerLifecycle($event)
+            ) {
+                $selected[] = $event;
+            }
+        }
+
+        return array_slice($selected, -80);
+    }
+
+    /**
+     * @param array<string, mixed> $event
+     */
+    private static function formatEvent(array $event, float $start, ?float $lastMutationAt): ?string
+    {
+        $prefix = sprintf('[+%s] ', self::formatDuration(self::durationMs(self::eventTime($event), $start)));
+        $type = (string) ($event['type'] ?? '');
+
+        if (self::isRead($event)) {
+            $status = ($event['value'] ?? null) === ($event['expected'] ?? null) ? 'OK' : 'ERROR';
+            $age = $lastMutationAt === null ? '' : ' stale_age=' . self::formatDuration(self::durationMs(self::eventTime($event), $lastMutationAt));
+
+            return $prefix . sprintf(
+                '[READ] pid=%s key=%s expected=%s read=%s %s%s tracked=%s attempt=%s',
+                self::value($event['pid'] ?? null),
+                self::value($event['key'] ?? null),
+                self::value($event['expected'] ?? null),
+                self::value($event['value'] ?? null),
+                $status,
+                $status === 'ERROR' ? $age : '',
+                self::value($event['tracked'] ?? null),
+                self::value($event['attempt'] ?? null),
+            );
+        }
+
+        if (self::isMutation($event)) {
+            $op = self::mutationOp($event);
+            $before = $event['previous_expected'] ?? $event['old_expected'] ?? $event['expected_before'] ?? null;
+            $after = $event['expected_after'] ?? $event['expected'] ?? $event['value'] ?? null;
+            $delta = $before !== null || $after !== null ? ' ' . self::value($before) . '=>' . self::value($after) : '';
+
+            return $prefix . sprintf(
+                '[MUTATE] op=%s key=%s%s amount=%s source=driver',
+                $op,
+                self::value($event['key'] ?? null),
+                $delta,
+                self::value($event['amount'] ?? null),
+            );
+        }
+
+        if ($type === 'kill') {
+            return $prefix . sprintf(
+                '[KILL] pid=%s signal=%s ok=%s',
+                self::value($event['pid'] ?? null),
+                self::value($event['signal'] ?? null),
+                self::value($event['ok'] ?? null),
+            );
+        }
+
+        if ($type === 'death_observed') {
+            return $prefix . sprintf('[DEAD] pid=%s', self::value($event['pid'] ?? null));
+        }
+
+        return null;
+    }
+
+    /**
+     * @param array<string, mixed> $event
+     */
+    private static function isRead(array $event): bool
+    {
+        return ($event['type'] ?? null) === 'get';
+    }
+
+    /**
+     * @param array<string, mixed> $event
+     */
+    private static function isMutationForKey(array $event, string $key): bool
+    {
+        if (!self::isMutation($event)) {
+            return false;
+        }
+
+        $eventKey = $event['key'] ?? null;
+
+        return $eventKey === $key || $eventKey === null;
+    }
+
+    /**
+     * @param array<string, mixed> $event
+     */
+    private static function isMutation(array $event): bool
+    {
+        $type = $event['type'] ?? null;
+
+        return $type === 'incr'
+            || $type === 'mutation'
+            || ($type === 'set' && ($event['phase'] ?? null) === 'rebuild');
+    }
+
+    /**
+     * @param array<string, mixed> $event
+     */
+    private static function isWorkerLifecycle(array $event): bool
+    {
+        return in_array($event['type'] ?? null, ['kill', 'death_observed'], true);
+    }
+
+    /**
+     * @param array<string, mixed> $event
+     */
+    private static function mutationOp(array $event): string
+    {
+        $op = $event['op'] ?? null;
+
+        if (is_string($op)) {
+            return $op;
+        }
+
+        return match ($event['type'] ?? null) {
+            'incr' => 'INCR',
+            'set' => 'SET',
+            default => 'MUTATE',
+        };
+    }
+
+    /**
+     * @param array<string, mixed> $event
+     */
+    private static function eventTime(array $event): ?float
+    {
+        $time = $event['time'] ?? null;
+
+        return is_numeric($time) ? (float) $time : null;
+    }
+
+    private static function durationMs(?float $time, float $start): float
+    {
+        return max(0.0, (($time ?? $start) - $start) * 1000.0);
+    }
+
+    private static function formatDuration(float $ms): string
+    {
+        return sprintf('%.3fms', $ms);
+    }
+
+    private static function value(mixed $value): string
+    {
+        if ($value === null) {
+            return 'null';
+        }
+
+        if (is_bool($value)) {
+            return $value ? 'true' : 'false';
+        }
+
+        return (string) $value;
+    }
+}
+
 final class HumanLogFormatter implements FormatterInterface
 {
     public function __construct(private readonly bool $decorated)
@@ -1618,9 +1885,16 @@ final class Fuzzer
 
         foreach ($keys as $key) {
             $this->logger->debug('incrementing Redis key', ['key' => $key, 'old_expected' => $this->expected[$key] ?? null]);
+            $previous = $this->expected[$key] ?? null;
             $value = $this->redis->incr($key);
             $this->expected[$key] = $value;
-            $event = ['type' => 'incr', 'key' => $key, 'value' => (string) $value];
+            $event = [
+                'type' => 'incr',
+                'key' => $key,
+                'previous_expected' => $previous === null ? null : (string) $previous,
+                'expected_after' => (string) $value,
+                'value' => (string) $value,
+            ];
             $this->recordEvent($event);
             $this->lastMutations->push($event);
             $this->logger->debug('incremented Redis key', ['key' => $key, 'value' => $value]);
@@ -2004,10 +2278,27 @@ final class Fuzzer
         ];
 
         file_put_contents($path, json_encode($payload, JSON_PRETTY_PRINT | JSON_THROW_ON_ERROR) . "\n");
+        $this->writeStaleSequenceLog($bundlePath, $type, $context);
         $this->server->copyRuntimeDirectory($bundlePath . DIRECTORY_SEPARATOR . 'server-runtime');
         $this->logger->error('wrote failure reproducer', ['path' => $bundlePath, 'reason' => $reason]);
 
         return $bundlePath;
+    }
+
+    /**
+     * @param array<string, mixed> $context
+     */
+    private function writeStaleSequenceLog(string $bundlePath, string $type, array $context): void
+    {
+        if ($type !== ReproducerTypes::STALE_KEY) {
+            return;
+        }
+
+        $lines = StaleSequenceLog::lines($this->events, $context);
+
+        if ($lines !== []) {
+            file_put_contents($bundlePath . DIRECTORY_SEPARATOR . 'stale-sequence.log', implode("\n", $lines) . "\n");
+        }
     }
 
     private static function pickFreePort(string $host): int
@@ -2463,11 +2754,15 @@ final class SequentialFuzzer
     private function mutateKeys(array $keys): void
     {
         foreach ($keys as $key) {
+            $previous = $this->expected[$key] ?? null;
             $value = $this->redis->incr($key);
             $this->expected[$key] = $value;
             $event = [
+                'op' => 'INCR',
                 'key' => $key,
+                'previous_expected' => $previous,
                 'expected' => $value,
+                'expected_after' => $value,
                 'owner_pid' => $this->keyOwner[$key] ?? null,
             ];
             $this->mutations[] = $event;
@@ -2867,6 +3162,7 @@ final class SequentialFuzzer
         file_put_contents($path . '/startup.json', json_encode($startup, JSON_PRETTY_PRINT | JSON_UNESCAPED_SLASHES | JSON_THROW_ON_ERROR) . "\n");
         file_put_contents($path . '/reproducer.json', json_encode($reproducer, JSON_PRETTY_PRINT | JSON_UNESCAPED_SLASHES | JSON_THROW_ON_ERROR) . "\n");
         file_put_contents($path . '/events.log', implode("\n", $this->eventLines) . ($this->eventLines === [] ? '' : "\n"));
+        $this->writeStaleSequenceLog($path, $type, $context);
         file_put_contents($path . '/server.stdout', $output['stdout']);
         file_put_contents($path . '/server.stderr', $output['stderr']);
         $this->server->copyRuntimeDirectory($path . '/server-runtime');
@@ -2876,6 +3172,22 @@ final class SequentialFuzzer
         }
 
         return $path;
+    }
+
+    /**
+     * @param array<string, mixed> $context
+     */
+    private function writeStaleSequenceLog(string $path, string $type, array $context): void
+    {
+        if ($type !== ReproducerTypes::STALE_KEY) {
+            return;
+        }
+
+        $lines = StaleSequenceLog::lines($this->events, $context);
+
+        if ($lines !== []) {
+            file_put_contents($path . '/stale-sequence.log', implode("\n", $lines) . "\n");
+        }
     }
 
     private function preserveRrTrace(string $destination): void
@@ -3184,9 +3496,16 @@ final class SimpleSequentialFuzzer
     private function rebuildKeyspaceAfterFlush(): void
     {
         foreach ($this->keys as $key) {
+            $previous = $this->expected[$key] ?? null;
             $this->redis->set($key, '1');
             $this->expected[$key] = 1;
-            $this->recordEvent('set', ['phase' => 'rebuild', 'key' => $key, 'value' => '1']);
+            $this->recordEvent('set', [
+                'phase' => 'rebuild',
+                'key' => $key,
+                'previous_expected' => $previous,
+                'expected_after' => 1,
+                'value' => '1',
+            ]);
         }
 
         $this->logLine('MUTATE', ['op' => 'REBUILD', 'keys' => count($this->keys), 'value' => 1]);
@@ -3386,13 +3705,16 @@ final class SimpleSequentialFuzzer
     {
         $key = $this->rng->pick($this->keys);
         $amount = $this->rng->int(1, 8);
+        $previous = $this->expected[$key] ?? null;
         $value = $this->redis->incrBy($key, $amount);
         $this->expected[$key] = $value;
         $event = [
             'op' => 'INCRBY',
             'key' => $key,
             'amount' => $amount,
+            'previous_expected' => $previous,
             'expected' => $value,
+            'expected_after' => $value,
         ];
         $this->lastMutation = $event;
         $this->mutations[] = $event;
@@ -3727,6 +4049,7 @@ final class SimpleSequentialFuzzer
         file_put_contents($path . '/startup.json', json_encode($startup, JSON_PRETTY_PRINT | JSON_UNESCAPED_SLASHES | JSON_THROW_ON_ERROR) . "\n");
         file_put_contents($path . '/reproducer.json', json_encode($reproducer, JSON_PRETTY_PRINT | JSON_UNESCAPED_SLASHES | JSON_THROW_ON_ERROR) . "\n");
         file_put_contents($path . '/events.log', implode("\n", $this->eventLines) . ($this->eventLines === [] ? '' : "\n"));
+        $this->writeStaleSequenceLog($path, $type, $context);
         file_put_contents($path . '/server.stdout', $output['stdout']);
         file_put_contents($path . '/server.stderr', $output['stderr']);
         $this->server->copyRuntimeDirectory($path . '/server-runtime');
@@ -3736,6 +4059,22 @@ final class SimpleSequentialFuzzer
         }
 
         return $path;
+    }
+
+    /**
+     * @param array<string, mixed> $context
+     */
+    private function writeStaleSequenceLog(string $path, string $type, array $context): void
+    {
+        if ($type !== ReproducerTypes::STALE_KEY) {
+            return;
+        }
+
+        $lines = StaleSequenceLog::lines($this->events, $context);
+
+        if ($lines !== []) {
+            file_put_contents($path . '/stale-sequence.log', implode("\n", $lines) . "\n");
+        }
     }
 
     private function preserveRrTrace(string $destination): void
