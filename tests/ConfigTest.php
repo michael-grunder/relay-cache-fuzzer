@@ -49,6 +49,7 @@ final class ConfigTest extends TestCase
 
         self::assertSame('redis-server', $config->redisServer);
         self::assertSame(0, $config->redisPort);
+        self::assertTrue($config->ownsRedisServer());
     }
 
     public function testHarnessJobIndexOffsetsRedisPort(): void
@@ -72,5 +73,28 @@ final class ConfigTest extends TestCase
 
         self::assertNull($config->redisServer);
         self::assertSame(6379, $config->redisPort);
+        self::assertFalse($config->ownsRedisServer());
+    }
+
+    public function testOwnedRedisUsesCompactKeyNames(): void
+    {
+        $config = Config::fromArgv([
+            'relay-cache-fuzzer',
+        ]);
+
+        self::assertSame('w1234:2', $config->workerKey('run-a', 1234, 2));
+        self::assertSame('k7', $config->sharedKey('run-a', 7));
+    }
+
+    public function testExternalRedisKeepsRunIsolatedKeyNames(): void
+    {
+        $config = Config::fromArgv([
+            'relay-cache-fuzzer',
+            '--redis-server=none',
+            '--redis-port=6379',
+        ]);
+
+        self::assertSame('relay-fuzz:run-a:1234:2', $config->workerKey('run-a', 1234, 2));
+        self::assertSame('relay-fuzz:run-a:key:7', $config->sharedKey('run-a', 7));
     }
 }

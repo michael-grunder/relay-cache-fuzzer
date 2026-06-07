@@ -2335,7 +2335,7 @@ final class Fuzzer
         $keys = [];
 
         for ($slot = 0; $slot < $this->config->keysPerWorker; $slot++) {
-            $key = "relay-fuzz:{$this->runId}:{$pid}:{$slot}";
+            $key = $this->config->workerKey($this->runId, $pid, $slot);
             $this->logger->debug('seeding Redis key for cache warmup', ['pid' => $pid, 'key' => $key, 'value' => 0]);
             $this->redis->set($key, '0');
             $this->expected[$key] = 0;
@@ -3096,7 +3096,7 @@ final class SequentialFuzzer
         $keys = [];
 
         for ($slot = 0; $slot < $this->config->keysPerWorker; $slot++) {
-            $key = "relay-fuzz:{$this->runId}:{$pid}:{$slot}";
+            $key = $this->config->workerKey($this->runId, $pid, $slot);
             $this->redis->set($key, '0');
             $this->expected[$key] = 0;
             $this->keyOwner[$key] = $pid;
@@ -4074,7 +4074,7 @@ final class SimpleSequentialFuzzer
         $this->expected = [];
 
         for ($i = 0; $i < $this->config->keys; $i++) {
-            $key = "relay-fuzz:{$this->runId}:key:{$i}";
+            $key = $this->config->sharedKey($this->runId, $i);
             $this->keys[] = $key;
             $this->redis->set($key, '1');
             $this->expected[$key] = 1;

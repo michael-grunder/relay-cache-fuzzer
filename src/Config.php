@@ -237,6 +237,29 @@ final class Config
         );
     }
 
+    public function ownsRedisServer(): bool
+    {
+        return $this->redisServer !== null;
+    }
+
+    public function workerKey(string $runId, int $pid, int $slot): string
+    {
+        if ($this->ownsRedisServer()) {
+            return "w{$pid}:{$slot}";
+        }
+
+        return "relay-fuzz:{$runId}:{$pid}:{$slot}";
+    }
+
+    public function sharedKey(string $runId, int $slot): string
+    {
+        if ($this->ownsRedisServer()) {
+            return "k{$slot}";
+        }
+
+        return "relay-fuzz:{$runId}:key:{$slot}";
+    }
+
     /**
      * @param list<string> $argv
      * @return array<string, string|bool>
