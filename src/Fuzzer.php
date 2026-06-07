@@ -1082,6 +1082,8 @@ final class ServerProcess
     private RingBuffer $stdout;
     private RingBuffer $stderr;
     private string $runtimeDir;
+    /** @var array<string, mixed>|null */
+    private ?array $startupProcessMetadata = null;
 
     public function __construct(
         private readonly Config $config,
@@ -1150,6 +1152,7 @@ final class ServerProcess
         $this->process->start();
 
         $this->logger->debug('server parent started', ['pid' => $this->process->getPid()]);
+        $this->captureStartupProcessMetadata();
     }
 
     private function startFpm(): void
@@ -1200,6 +1203,7 @@ final class ServerProcess
         ]);
         $this->logger->debug('nginx command line', ['command' => $this->nginxProcess->getCommandLine()]);
         $this->nginxProcess->start();
+        $this->captureStartupProcessMetadata();
     }
 
     private function prepareFpmRuntimeDirectory(): void
@@ -1333,6 +1337,71 @@ CONF;
     public function parentPid(): ?int
     {
         return $this->process->getPid();
+    }
+
+    /**
+     * @return array<string, mixed>|null
+     */
+    public function startupProcessMetadata(): ?array
+    {
+        return $this->startupProcessMetadata;
+    }
+
+    public function startupProcessMetadataText(): string
+    {
+        $metadata = $this->startupProcessMetadata;
+
+        if ($metadata === null) {
+            return "Server process metadata was not captured.\n";
+        }
+
+        $lines = [
+            'Server Process Metadata',
+            '=======================',
+            '',
+            'Captured At : ' . (string) ($metadata['captured_at'] ?? 'unknown'),
+            'Transport   : ' . (string) ($metadata['transport'] ?? 'unknown'),
+            'Workers     : ' . (string) ($metadata['expected_workers'] ?? 'unknown'),
+            '',
+        ];
+
+        $php = $metadata['php_server'] ?? null;
+        if (is_array($php)) {
+            $lines[] = 'PHP Server';
+            $lines[] = '----------';
+            $lines = array_merge($lines, self::formatProcessTreeLines($php));
+            $lines[] = '';
+        }
+
+        $nginx = $metadata['nginx'] ?? null;
+        if (is_array($nginx)) {
+            $lines[] = 'Nginx';
+            $lines[] = '-----';
+            $lines = array_merge($lines, self::formatProcessTreeLines($nginx));
+            $lines[] = '';
+        }
+
+        $workers = $metadata['php_worker_pids'] ?? [];
+        if (is_array($workers)) {
+            $lines[] = 'PHP Worker PIDs';
+            $lines[] = '---------------';
+            $lines[] = $workers === [] ? '(none captured)' : implode(', ', array_map('strval', $workers));
+            $lines[] = '';
+        }
+
+        $notes = $metadata['notes'] ?? [];
+        if (is_array($notes) && $notes !== []) {
+            $lines[] = 'Notes';
+            $lines[] = '-----';
+
+            foreach ($notes as $note) {
+                $lines[] = '- ' . (string) $note;
+            }
+
+            $lines[] = '';
+        }
+
+        return implode("\n", $lines);
     }
 
     public function commandLine(): string
@@ -1522,6 +1591,265 @@ CONF;
                 $buffer->push($line);
                 $this->logger->debug('server output', ['stream' => $stream, 'line' => $line]);
             }
+        }
+    }
+
+    private function captureStartupProcessMetadata(): void
+    {
+        $deadline = microtime(true) + 2.0;
+        $metadata = null;
+
+        do {
+            $metadata = $this->buildStartupProcessMetadata();
+
+            if (count($metadata['php_worker_pids']) >= $this->config->workers) {
+                break;
+            }
+
+            usleep(20_000);
+        } while (microtime(true) < $deadline);
+
+        if (count($metadata['php_worker_pids']) < $this->config->workers) {
+            $metadata['notes'][] = 'Captured fewer PHP worker PIDs than configured workers before startup snapshot timeout.';
+        }
+
+        $this->startupProcessMetadata = $metadata;
+        $this->logger->debug('captured startup server process metadata', [
+            'php_worker_pids' => $metadata['php_worker_pids'],
+        ]);
+    }
+
+    /**
+     * @return array<string, mixed>
+     */
+    private function buildStartupProcessMetadata(): array
+    {
+        $phpPid = $this->process->getPid();
+        $nginxPid = $this->nginxProcess instanceof Process ? $this->nginxProcess->getPid() : null;
+        $notes = [];
+
+        if (!is_dir('/proc')) {
+            $notes[] = '/proc is not available; process tree details are limited.';
+        }
+
+        $phpTree = $phpPid === null ? null : self::processTree($phpPid);
+        $nginxTree = $nginxPid === null ? null : self::processTree($nginxPid);
+        $workerPids = $phpTree === null ? [] : self::phpWorkerPids($phpTree, $phpPid);
+
+        if ($phpPid === null) {
+            $notes[] = 'PHP server master PID was not available from Symfony Process.';
+        }
+
+        return [
+            'captured_at' => date(DATE_ATOM),
+            'captured_at_unix' => sprintf('%.6f', microtime(true)),
+            'transport' => $this->config->fpm ? 'fpm' : 'cli',
+            'expected_workers' => $this->config->workers,
+            'php_server' => $phpTree,
+            'nginx' => $nginxTree,
+            'php_worker_pids' => $workerPids,
+            'notes' => $notes,
+        ];
+    }
+
+    /**
+     * @return array<string, mixed>
+     */
+    private static function processTree(int $pid): array
+    {
+        $node = self::processInfo($pid);
+        $children = self::childrenOf($pid);
+
+        sort($children);
+
+        $node['children'] = array_map(self::processTree(...), $children);
+
+        return $node;
+    }
+
+    /**
+     * @return array<string, mixed>
+     */
+    private static function processInfo(int $pid): array
+    {
+        $info = [
+            'pid' => $pid,
+            'exists' => is_dir("/proc/{$pid}"),
+        ];
+
+        $stat = @file_get_contents("/proc/{$pid}/stat");
+        if (is_string($stat) && preg_match('/^(\d+)\s+\((.*)\)\s+([A-Z])\s+(\d+)/', $stat, $matches)) {
+            $info['comm'] = $matches[2];
+            $info['state'] = $matches[3];
+            $info['ppid'] = (int) $matches[4];
+        }
+
+        $cmdline = @file_get_contents("/proc/{$pid}/cmdline");
+        if (is_string($cmdline)) {
+            $parts = array_values(array_filter(explode("\0", rtrim($cmdline, "\0")), static fn (string $part): bool => $part !== ''));
+            $info['argv'] = $parts;
+            $info['command'] = implode(' ', $parts);
+        }
+
+        $exe = @readlink("/proc/{$pid}/exe");
+        if (is_string($exe)) {
+            $info['exe'] = $exe;
+        }
+
+        $cwd = @readlink("/proc/{$pid}/cwd");
+        if (is_string($cwd)) {
+            $info['cwd'] = $cwd;
+        }
+
+        $status = @file("/proc/{$pid}/status", FILE_IGNORE_NEW_LINES);
+        if (is_array($status)) {
+            foreach ($status as $line) {
+                if (preg_match('/^(Name|State|PPid|Threads|VmRSS|VmSize):\s*(.+)$/', $line, $matches)) {
+                    $info['status'][$matches[1]] = $matches[2];
+                }
+            }
+        }
+
+        return $info;
+    }
+
+    /**
+     * @return list<int>
+     */
+    private static function childrenOf(int $pid): array
+    {
+        $childrenFile = "/proc/{$pid}/task/{$pid}/children";
+        $children = @file_get_contents($childrenFile);
+
+        if (is_string($children)) {
+            $children = trim($children);
+
+            if ($children === '') {
+                return [];
+            }
+
+            return array_map('intval', preg_split('/\s+/', $children) ?: []);
+        }
+
+        $pids = [];
+        foreach (glob('/proc/[0-9]*/stat') ?: [] as $statFile) {
+            $stat = @file_get_contents($statFile);
+
+            if (is_string($stat) && preg_match('/^(\d+)\s+\(.*\)\s+[A-Z]\s+(\d+)/', $stat, $matches) && (int) $matches[2] === $pid) {
+                $pids[] = (int) $matches[1];
+            }
+        }
+
+        return $pids;
+    }
+
+    /**
+     * @param array<string, mixed> $tree
+     * @return list<int>
+     */
+    private static function phpWorkerPids(array $tree, int $rootPid): array
+    {
+        $pids = [];
+
+        foreach (self::flattenProcessTree($tree) as $node) {
+            $pid = $node['pid'] ?? null;
+
+            if (!is_int($pid) || $pid === $rootPid) {
+                continue;
+            }
+
+            if (self::isPhpProcess($node) && !self::hasPhpChild($node)) {
+                $pids[] = $pid;
+            }
+        }
+
+        sort($pids);
+
+        return $pids;
+    }
+
+    /**
+     * @param array<string, mixed> $node
+     */
+    private static function isPhpProcess(array $node): bool
+    {
+        $command = strtolower((string) ($node['command'] ?? $node['comm'] ?? ''));
+        $exe = strtolower((string) ($node['exe'] ?? ''));
+
+        return str_contains($command, 'php') || str_contains($exe, 'php');
+    }
+
+    /**
+     * @param array<string, mixed> $node
+     */
+    private static function hasPhpChild(array $node): bool
+    {
+        foreach (($node['children'] ?? []) as $child) {
+            if (is_array($child) && self::isPhpProcess($child)) {
+                return true;
+            }
+        }
+
+        return false;
+    }
+
+    /**
+     * @param array<string, mixed> $tree
+     * @return list<array<string, mixed>>
+     */
+    private static function flattenProcessTree(array $tree): array
+    {
+        $nodes = [$tree];
+
+        foreach (($tree['children'] ?? []) as $child) {
+            if (is_array($child)) {
+                $nodes = array_merge($nodes, self::flattenProcessTree($child));
+            }
+        }
+
+        return $nodes;
+    }
+
+    /**
+     * @param array<string, mixed> $tree
+     * @return list<string>
+     */
+    private static function formatProcessTreeLines(array $tree, string $prefix = ''): array
+    {
+        $pid = (string) ($tree['pid'] ?? '?');
+        $ppid = array_key_exists('ppid', $tree) ? ' ppid=' . (string) $tree['ppid'] : '';
+        $state = array_key_exists('state', $tree) ? ' state=' . (string) $tree['state'] : '';
+        $command = (string) ($tree['command'] ?? $tree['comm'] ?? '(unknown command)');
+        $lines = [$prefix . 'pid=' . $pid . $ppid . $state . ' cmd=' . $command];
+
+        if (isset($tree['exe'])) {
+            $lines[] = $prefix . '  exe=' . (string) $tree['exe'];
+        }
+
+        if (isset($tree['cwd'])) {
+            $lines[] = $prefix . '  cwd=' . (string) $tree['cwd'];
+        }
+
+        foreach (($tree['children'] ?? []) as $child) {
+            if (is_array($child)) {
+                $lines = array_merge($lines, self::formatProcessTreeLines($child, $prefix . '  '));
+            }
+        }
+
+        return $lines;
+    }
+}
+
+final class ServerProcessMetadataFiles
+{
+    public static function write(ServerProcess $server, string $bundlePath): void
+    {
+        $metadata = $server->startupProcessMetadata();
+
+        file_put_contents($bundlePath . DIRECTORY_SEPARATOR . 'server-processes.txt', $server->startupProcessMetadataText());
+
+        if ($metadata !== null) {
+            file_put_contents($bundlePath . DIRECTORY_SEPARATOR . 'server-processes.json', json_encode($metadata, JSON_PRETTY_PRINT | JSON_UNESCAPED_SLASHES | JSON_THROW_ON_ERROR) . "\n");
         }
     }
 }
@@ -2253,6 +2581,7 @@ final class Fuzzer
                 'command_line' => $this->server->commandLine(),
                 'output' => $this->server->tails(),
                 'runtime_dir' => $this->server->runtimeDirectory(),
+                'startup_process_metadata' => $this->server->startupProcessMetadata(),
             ],
             'redis' => [
                 'host' => $this->config->redisHost,
@@ -2278,6 +2607,7 @@ final class Fuzzer
         ];
 
         file_put_contents($path, json_encode($payload, JSON_PRETTY_PRINT | JSON_THROW_ON_ERROR) . "\n");
+        ServerProcessMetadataFiles::write($this->server, $bundlePath);
         $this->writeStaleSequenceLog($bundlePath, $type, $context);
         $this->server->copyRuntimeDirectory($bundlePath . DIRECTORY_SEPARATOR . 'server-runtime');
         $this->logger->error('wrote failure reproducer', ['path' => $bundlePath, 'reason' => $reason]);
@@ -3120,6 +3450,7 @@ final class SequentialFuzzer
             'server_transport' => $this->config->fpm ? 'fpm' : 'cli',
             'command_line' => $commandLine,
             'runtime_dir' => $this->server->runtimeDirectory(),
+            'startup_process_metadata' => $this->server->startupProcessMetadata(),
             'relay_ini' => [
                 'relay.max_endpoint_dbs' => $this->config->relayMaxEndpointDbs,
                 'relay.max_db_writers' => $this->config->relayMaxDbWriters,
@@ -3165,6 +3496,7 @@ final class SequentialFuzzer
         $this->writeStaleSequenceLog($path, $type, $context);
         file_put_contents($path . '/server.stdout', $output['stdout']);
         file_put_contents($path . '/server.stderr', $output['stderr']);
+        ServerProcessMetadataFiles::write($this->server, $path);
         $this->server->copyRuntimeDirectory($path . '/server-runtime');
 
         if ($this->config->rr && $this->rrTraceDir !== null) {
@@ -4004,6 +4336,7 @@ final class SimpleSequentialFuzzer
             'server_transport' => $this->config->fpm ? 'fpm' : 'cli',
             'command_line' => $commandLine,
             'runtime_dir' => $this->server->runtimeDirectory(),
+            'startup_process_metadata' => $this->server->startupProcessMetadata(),
             'relay_ini' => [
                 'relay.max_endpoint_dbs' => $this->config->relayMaxEndpointDbs,
                 'relay.max_db_writers' => $this->config->relayMaxDbWriters,
@@ -4052,6 +4385,7 @@ final class SimpleSequentialFuzzer
         $this->writeStaleSequenceLog($path, $type, $context);
         file_put_contents($path . '/server.stdout', $output['stdout']);
         file_put_contents($path . '/server.stderr', $output['stderr']);
+        ServerProcessMetadataFiles::write($this->server, $path);
         $this->server->copyRuntimeDirectory($path . '/server-runtime');
 
         if ($this->config->rr && $this->rrTraceDir !== null) {

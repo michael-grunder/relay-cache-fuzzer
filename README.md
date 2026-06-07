@@ -238,6 +238,8 @@ The `reproducer.json` file includes:
 - observed and killed worker PIDs
 - request, mutation, and stale-observation tails
 - server stdout and stderr tails
+- startup PHP server process metadata in `server-processes.txt` and
+  `server-processes.json`
 - the event stream leading to failure
 
 When `--fpm` is used, the bundle also includes `server-runtime/` with generated
@@ -256,7 +258,8 @@ reproducers/sequential/stale_key/00001/
 ```
 
 The bundle contains `startup.json`, `reproducer.json`, `events.log`,
-`server.stdout`, `server.stderr`, `server-runtime/` for `--fpm` runs, and, when
+`server.stdout`, `server.stderr`, `server-processes.txt`,
+`server-processes.json`, `server-runtime/` for `--fpm` runs, and, when
 `--rr` was enabled and rr finalized the trace, an `rr/` copy. The fuzzer waits
 for rr `incomplete` markers to disappear before copying a trace into the bundle.
 
