@@ -153,7 +153,7 @@ Harness options:
   --no-tui              Plain event logging.
   --stats-interval=N    Dashboard refresh interval in seconds. Default: 1.
   --seed=N              Harness RNG seed.
-  --keep-run-artifacts  Preserve successful per-run artifacts under artifacts/runs.
+  --keep-run-artifacts  Preserve per-run artifacts under artifacts/runs.
 
 Inferior exit statuses:
   0 = normal completion
@@ -1326,14 +1326,6 @@ final class Coordinator
 
         if ($exitCode === 0) {
             $this->events->add("Job completed id={$job->id} runs={$job->runCount}");
-
-            if (!$this->config->keepRunArtifacts) {
-                if ($this->artifacts->cleanupRunDirectory($job)) {
-                    $this->events->add("Cleaned run artifacts job={$job->id} dir={$job->runDir}");
-                } else {
-                    $this->events->add("Could not clean run artifacts job={$job->id} dir={$job->runDir}");
-                }
-            }
         } elseif ($exitCode === 2) {
             $job->failures++;
             $this->stats->totalFailures++;
@@ -1350,12 +1342,15 @@ final class Coordinator
 
             if ($this->config->stopOnFirst) {
                 $this->stopping = true;
+                $this->cleanupRunArtifacts($job);
                 $this->stopAllJobs();
                 return;
             }
         } else {
             $this->events->add("Job infrastructure error id={$job->id} exit={$exitCode}");
         }
+
+        $this->cleanupRunArtifacts($job);
 
         if (!$this->stopping && $this->config->keepGoing) {
             $this->startJob($job);
@@ -1371,7 +1366,24 @@ final class Coordinator
                 $job->state = 'stopping';
                 $job->process->stop(2.0, 15);
                 $job->state = 'stopped';
+                $job->pid = null;
+                $this->cleanupRunArtifacts($job);
             }
+        }
+    }
+
+    private function cleanupRunArtifacts(Job $job): void
+    {
+        if ($this->config->keepRunArtifacts) {
+            return;
+        }
+
+        $runDir = $job->runDir;
+
+        if ($this->artifacts->cleanupRunDirectory($job)) {
+            $this->events->add("Cleaned run artifacts job={$job->id} dir={$runDir}");
+        } else {
+            $this->events->add("Could not clean run artifacts job={$job->id} dir={$runDir}");
         }
     }
 

@@ -54,12 +54,12 @@ bin/harness \
 
 The harness treats `relay-cache-fuzzer` as an inferior process. It appends a
 unique `--run-id`, `--seed`, and `--keyspace-isolated` to each run, records
-per-run logs under `artifacts/runs/` while a run is active, removes successful
-run artifacts by default, and copies flaw artifacts into
+per-run logs under `artifacts/runs/` while a run is active, removes per-run
+artifacts by default, and copies flaw artifacts into
 `artifacts/failures/000001`, `000002`, and so on. Inferior exit codes are:
 `0` for normal completion, `1` for setup or infrastructure errors, and `2` for
-flaws with reproducers. Pass `--keep-run-artifacts` to preserve successful
-per-run artifacts for manual inspection.
+flaws with reproducers. Pass `--keep-run-artifacts` to preserve per-run
+artifacts for manual inspection.
 
 Integer fuzzer arguments can be templated for reduction:
 
