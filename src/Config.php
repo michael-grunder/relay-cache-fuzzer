@@ -26,6 +26,7 @@ final class Config
         public readonly int $seed,
         public readonly int $relayMaxEndpointDbs,
         public readonly int $relayMaxDbWriters,
+        public readonly ?string $captureRelayLogLevel,
         public readonly float $killRate,
         public readonly int $maxKill,
         public readonly int $keys,
@@ -91,6 +92,7 @@ final class Config
             seed: $seed,
             relayMaxEndpointDbs: max(1, self::int($raw, 'relay-max-endpoint-dbs', 1)),
             relayMaxDbWriters: max(1, self::int($raw, 'relay-max-db-writers', 1)),
+            captureRelayLogLevel: self::captureRelayLogLevel($raw),
             killRate: max(0.0, min(1.0, self::float($raw, 'kill-rate', 0.25))),
             maxKill: max(1, self::int($raw, 'max-kill', 1)),
             keys: max(1, self::int($raw, 'keys', 100)),
@@ -141,6 +143,7 @@ final class Config
             seed: $this->seed,
             relayMaxEndpointDbs: $this->relayMaxEndpointDbs,
             relayMaxDbWriters: $this->relayMaxDbWriters,
+            captureRelayLogLevel: $this->captureRelayLogLevel,
             killRate: $this->killRate,
             maxKill: $this->maxKill,
             keys: $this->keys,
@@ -327,6 +330,12 @@ Relay INI:
       relay.max_db_writers passed to the PHP CLI server. Must be >= 1.
       Default: 1.
 
+  --capture-relay-log[=LEVEL]
+      Capture Relay's own log to the per-run server runtime directory by
+      passing relay.loglevel and relay.logfile to the PHP server. LEVEL may be
+      debug, notice, warning, or error. If LEVEL is omitted or unsupported,
+      debug is used.
+
 Randomized fuzzing:
   --seed=N
       Random seed. If omitted, a seed is generated and logged. Reuse a printed
@@ -510,6 +519,26 @@ HELP;
 
         if (!in_array($level, $levels, true)) {
             throw new FuzzerException('--log-level must be one of debug, info, notice, warning, error, critical, alert, emergency');
+        }
+
+        return $level;
+    }
+
+    /**
+     * @param array<string, string|bool> $raw
+     */
+    private static function captureRelayLogLevel(array $raw): ?string
+    {
+        if (!isset($raw['capture-relay-log']) || $raw['capture-relay-log'] === '0' || $raw['capture-relay-log'] === 'false') {
+            return null;
+        }
+
+        $level = $raw['capture-relay-log'] === true ? 'debug' : strtolower(trim($raw['capture-relay-log']));
+        $levels = ['debug', 'notice', 'warning', 'error'];
+
+        if (!in_array($level, $levels, true)) {
+            @file_put_contents('php://stderr', "Warning: unsupported --capture-relay-log level '{$level}', using debug\n", FILE_APPEND);
+            return 'debug';
         }
 
         return $level;

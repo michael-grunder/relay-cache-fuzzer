@@ -190,6 +190,7 @@ Common options:
 - `--seed=N`
 - `--relay-max-endpoint-dbs=N`
 - `--relay-max-db-writers=N`
+- `--capture-relay-log[=LEVEL]`: capture Relay's own log at `debug`, `notice`, `warning`, or `error`. Omitting `LEVEL`, or passing an unsupported level, uses `debug`. Captured logs are written to `relay.log` in the per-run server runtime directory, which is preserved when capture is enabled and copied to `server-runtime/relay.log` in failure bundles.
 - `--kill-rate=FLOAT`
 - `--max-kill=N`
 - `--keys=N`: shared keyspace size for `simple-sequential`.
@@ -243,7 +244,8 @@ The `reproducer.json` file includes:
 - the event stream leading to failure
 
 When `--fpm` is used, the bundle also includes `server-runtime/` with generated
-nginx/php-fpm configs and logs.
+nginx/php-fpm configs and logs. When `--capture-relay-log[=LEVEL]` is used,
+`server-runtime/relay.log` is included for both CLI-server and FPM runs.
 
 Human diagnostics are written to stderr by default, or to `--log-file` when
 specified. TTY logs use concise microtime prefixes and rich styling for humans;
@@ -259,9 +261,10 @@ reproducers/sequential/stale_key/00001/
 
 The bundle contains `startup.json`, `reproducer.json`, `events.log`,
 `server.stdout`, `server.stderr`, `server-processes.txt`,
-`server-processes.json`, `server-runtime/` for `--fpm` runs, and, when
-`--rr` was enabled and rr finalized the trace, an `rr/` copy. The fuzzer waits
-for rr `incomplete` markers to disappear before copying a trace into the bundle.
+`server-processes.json`, `server-runtime/` for `--fpm` or
+`--capture-relay-log` runs, and, when `--rr` was enabled and rr finalized the
+trace, an `rr/` copy. The fuzzer waits for rr `incomplete` markers to disappear
+before copying a trace into the bundle.
 
 Replay an event stream with:
 

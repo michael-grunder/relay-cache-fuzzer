@@ -523,6 +523,8 @@ final class StartupBlock
             ['section' => 'relay_ini', 'setting' => 'relay.cache', 'value' => 1],
             ['section' => 'relay_ini', 'setting' => 'relay.max_endpoint_dbs', 'value' => $config->relayMaxEndpointDbs],
             ['section' => 'relay_ini', 'setting' => 'relay.max_db_writers', 'value' => $config->relayMaxDbWriters],
+            ['section' => 'relay_ini', 'setting' => 'relay.loglevel', 'value' => $config->captureRelayLogLevel],
+            ['section' => 'relay_ini', 'setting' => 'relay.logfile', 'value' => $config->captureRelayLogLevel === null ? null : 'server-runtime/relay.log'],
             ['section' => 'keys', 'setting' => 'keys', 'value' => $config->keys],
             ['section' => 'keys', 'setting' => 'keys_per_worker', 'value' => $config->keysPerWorker],
             ['section' => 'keys', 'setting' => 'warmup_reads', 'value' => $config->warmupReads],
@@ -1109,15 +1111,22 @@ final class ServerProcess
 
     private function startCliServer(): void
     {
+        if ($this->config->captureRelayLogLevel !== null) {
+            $this->prepareRuntimeDirectory();
+        }
+
         $router = dirname(__DIR__) . '/router.php';
         $command = [
             $this->config->php,
             '-d', 'relay.max_endpoint_dbs=' . $this->config->relayMaxEndpointDbs,
             '-d', 'relay.max_db_writers=' . $this->config->relayMaxDbWriters,
             '-d', 'relay.cache=1',
+        ];
+
+        $command = array_merge($command, $this->relayLogIniArguments(), [
             '-S', $this->config->host . ':' . $this->config->port,
             $router,
-        ];
+        ]);
         $env = [
             'PHP_CLI_SERVER_WORKERS' => (string) $this->config->workers,
             'RELAY_FUZZ_CLIENT' => $this->config->client,
@@ -1147,6 +1156,7 @@ final class ServerProcess
             'rr' => $this->config->rr,
             'rr_trace_dir' => $this->rrTraceDir,
             'client' => $this->config->client,
+            'relay_logfile' => $this->relayLogFile(),
         ]);
         $this->logger->debug('server command line', ['command' => $this->process->getCommandLine()]);
         $this->process->start();
@@ -1181,6 +1191,7 @@ final class ServerProcess
             '-d', 'relay.max_db_writers=' . $this->config->relayMaxDbWriters,
             '-d', 'relay.cache=1',
         ];
+        $command = array_merge($command, $this->relayLogIniArguments());
 
         $this->process = new Process($command, dirname(__DIR__), $env);
         $this->process->setTimeout(null);
@@ -1189,6 +1200,7 @@ final class ServerProcess
             'socket' => $socketPath,
             'runtime_dir' => $this->runtimeDir,
             'client' => $this->config->client,
+            'relay_logfile' => $this->relayLogFile(),
         ]);
         $this->logger->debug('php-fpm command line', ['command' => $this->process->getCommandLine()]);
         $this->process->start();
@@ -1208,9 +1220,7 @@ final class ServerProcess
 
     private function prepareFpmRuntimeDirectory(): void
     {
-        if (!is_dir($this->runtimeDir) && !mkdir($this->runtimeDir, 0777, true) && !is_dir($this->runtimeDir)) {
-            throw new FuzzerException("Could not create FPM runtime directory {$this->runtimeDir}");
-        }
+        $this->prepareRuntimeDirectory();
 
         foreach (['logs', 'client-body'] as $dir) {
             $path = $this->runtimeDir . DIRECTORY_SEPARATOR . $dir;
@@ -1219,6 +1229,33 @@ final class ServerProcess
                 throw new FuzzerException("Could not create FPM runtime subdirectory {$path}");
             }
         }
+    }
+
+    private function prepareRuntimeDirectory(): void
+    {
+        if (!is_dir($this->runtimeDir) && !mkdir($this->runtimeDir, 0777, true) && !is_dir($this->runtimeDir)) {
+            throw new FuzzerException("Could not create server runtime directory {$this->runtimeDir}");
+        }
+    }
+
+    /**
+     * @return list<string>
+     */
+    private function relayLogIniArguments(): array
+    {
+        if ($this->config->captureRelayLogLevel === null) {
+            return [];
+        }
+
+        $relayLogFile = $this->relayLogFile();
+        if ($relayLogFile === null) {
+            return [];
+        }
+
+        return [
+            '-d', 'relay.loglevel=' . $this->config->captureRelayLogLevel,
+            '-d', 'relay.logfile=' . $relayLogFile,
+        ];
     }
 
     private function writeFpmConfig(string $fpmConfig, string $poolConfig, string $pidPath, string $socketPath): void
@@ -1516,12 +1553,22 @@ CONF;
 
     public function runtimeDirectory(): ?string
     {
-        return $this->config->fpm ? $this->runtimeDir : null;
+        return $this->config->fpm || $this->config->captureRelayLogLevel !== null ? $this->runtimeDir : null;
+    }
+
+    public function relayLogFile(): ?string
+    {
+        return $this->config->captureRelayLogLevel === null ? null : $this->runtimeDir . DIRECTORY_SEPARATOR . 'relay.log';
     }
 
     public function cleanupRuntimeDirectory(): void
     {
-        if (!$this->config->fpm || $this->config->keepTemp || !is_dir($this->runtimeDir)) {
+        if (
+            $this->runtimeDirectory() === null
+            || $this->config->keepTemp
+            || $this->config->captureRelayLogLevel !== null
+            || !is_dir($this->runtimeDir)
+        ) {
             return;
         }
 
@@ -1530,7 +1577,7 @@ CONF;
 
     public function copyRuntimeDirectory(string $destination): void
     {
-        if (!$this->config->fpm || !is_dir($this->runtimeDir)) {
+        if ($this->runtimeDirectory() === null || !is_dir($this->runtimeDir)) {
             return;
         }
 
@@ -2597,6 +2644,8 @@ final class Fuzzer
                 'relay.max_endpoint_dbs' => $this->config->relayMaxEndpointDbs,
                 'relay.max_db_writers' => $this->config->relayMaxDbWriters,
                 'relay.cache' => 1,
+                'relay.loglevel' => $this->config->captureRelayLogLevel,
+                'relay.logfile' => $this->server->relayLogFile(),
             ],
             'stats' => $this->stats,
             'worker_command_counts' => $this->workerCommandCounts,
@@ -3455,6 +3504,8 @@ final class SequentialFuzzer
                 'relay.max_endpoint_dbs' => $this->config->relayMaxEndpointDbs,
                 'relay.max_db_writers' => $this->config->relayMaxDbWriters,
                 'relay.cache' => 1,
+                'relay.loglevel' => $this->config->captureRelayLogLevel,
+                'relay.logfile' => $this->server->relayLogFile(),
             ],
             'workers' => $this->config->workers,
             'redis' => [
@@ -4341,6 +4392,8 @@ final class SimpleSequentialFuzzer
                 'relay.max_endpoint_dbs' => $this->config->relayMaxEndpointDbs,
                 'relay.max_db_writers' => $this->config->relayMaxDbWriters,
                 'relay.cache' => 1,
+                'relay.loglevel' => $this->config->captureRelayLogLevel,
+                'relay.logfile' => $this->server->relayLogFile(),
             ],
             'workers' => $this->config->workers,
             'keys' => $this->config->keys,
