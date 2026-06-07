@@ -45,6 +45,7 @@ final class HarnessConfig
         public readonly bool $tui,
         public readonly float $statsInterval,
         public readonly int $seed,
+        public readonly bool $keepRunArtifacts,
         public readonly array $inferiorCommand,
     ) {
     }
@@ -86,6 +87,7 @@ final class HarnessConfig
             tui: isset($raw['tui']) ? self::bool($raw, 'tui') : !isset($raw['no-tui']) && self::stdoutIsTty(),
             statsInterval: max(0.1, self::float($raw, 'stats-interval', 1.0)),
             seed: $seed,
+            keepRunArtifacts: self::bool($raw, 'keep-run-artifacts'),
             inferiorCommand: $inferiorCommand,
         );
     }
@@ -151,6 +153,7 @@ Harness options:
   --no-tui              Plain event logging.
   --stats-interval=N    Dashboard refresh interval in seconds. Default: 1.
   --seed=N              Harness RNG seed.
+  --keep-run-artifacts  Preserve successful per-run artifacts under artifacts/runs.
 
 Inferior exit statuses:
   0 = normal completion
@@ -553,6 +556,26 @@ final class ArtifactManager
         return $path;
     }
 
+    public function cleanupRunDirectory(Job $job): bool
+    {
+        if ($job->runDir === '') {
+            return true;
+        }
+
+        $runRoot = $this->runRoot();
+        $runDir = $job->runDir;
+
+        if (!str_starts_with($runDir, $runRoot . DIRECTORY_SEPARATOR)) {
+            return false;
+        }
+
+        if (!is_dir($runDir)) {
+            return true;
+        }
+
+        return $this->removeTree($runDir);
+    }
+
     /**
      * @param array<string, int> $reductionValues
      */
@@ -656,6 +679,29 @@ final class ArtifactManager
                 copy($from, $to);
             }
         }
+    }
+
+    private function removeTree(string $path): bool
+    {
+        foreach (scandir($path) ?: [] as $entry) {
+            if ($entry === '.' || $entry === '..') {
+                continue;
+            }
+
+            $child = $path . DIRECTORY_SEPARATOR . $entry;
+
+            if (is_dir($child) && !is_link($child)) {
+                if (!$this->removeTree($child)) {
+                    return false;
+                }
+            } elseif (is_file($child) || is_link($child)) {
+                if (!unlink($child)) {
+                    return false;
+                }
+            }
+        }
+
+        return rmdir($path);
     }
 
     private function ensureDirectory(string $path): void
@@ -1280,6 +1326,14 @@ final class Coordinator
 
         if ($exitCode === 0) {
             $this->events->add("Job completed id={$job->id} runs={$job->runCount}");
+
+            if (!$this->config->keepRunArtifacts) {
+                if ($this->artifacts->cleanupRunDirectory($job)) {
+                    $this->events->add("Cleaned run artifacts job={$job->id} dir={$job->runDir}");
+                } else {
+                    $this->events->add("Could not clean run artifacts job={$job->id} dir={$job->runDir}");
+                }
+            }
         } elseif ($exitCode === 2) {
             $job->failures++;
             $this->stats->totalFailures++;
