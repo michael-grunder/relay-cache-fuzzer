@@ -40,4 +40,37 @@ final class ConfigTest extends TestCase
 
         self::assertSame('debug', $config->captureRelayLogLevel);
     }
+
+    public function testRedisDefaultsToEphemeralServerOnFreePort(): void
+    {
+        $config = Config::fromArgv([
+            'relay-cache-fuzzer',
+        ]);
+
+        self::assertSame('redis-server', $config->redisServer);
+        self::assertSame(0, $config->redisPort);
+    }
+
+    public function testHarnessJobIndexOffsetsRedisPort(): void
+    {
+        $config = Config::fromArgv([
+            'relay-cache-fuzzer',
+            '--redis-port=7000',
+            '--harness-job-index=3',
+        ]);
+
+        self::assertSame(7003, $config->redisPort);
+    }
+
+    public function testRedisServerNoneUsesExternalRedis(): void
+    {
+        $config = Config::fromArgv([
+            'relay-cache-fuzzer',
+            '--redis-server=none',
+            '--redis-port=6379',
+        ]);
+
+        self::assertNull($config->redisServer);
+        self::assertSame(6379, $config->redisPort);
+    }
 }

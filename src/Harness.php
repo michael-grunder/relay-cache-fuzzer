@@ -934,13 +934,38 @@ final class ReductionManager
     {
         $command[] = '--seed=' . $seed;
         $command[] = '--run-id=' . $runId;
-        $command[] = '--keyspace-isolated';
+
+        if (self::usesExternalRedis($command)) {
+            $command[] = '--keyspace-isolated';
+        }
 
         if ($jobIndex !== null) {
             $command[] = '--harness-job-index=' . $jobIndex;
         }
 
         return $command;
+    }
+
+    /**
+     * @param list<string> $command
+     */
+    private static function usesExternalRedis(array $command): bool
+    {
+        $count = count($command);
+
+        for ($i = 0; $i < $count; $i++) {
+            $arg = $command[$i];
+
+            if ($arg === '--redis-server=none' || $arg === '--redis-server=') {
+                return true;
+            }
+
+            if ($arg === '--redis-server' && strtolower($command[$i + 1] ?? '') === 'none') {
+                return true;
+            }
+        }
+
+        return false;
     }
 }
 

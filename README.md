@@ -13,7 +13,8 @@ have had time to observe invalidation state.
 ## Requirements
 
 - PHP with the Relay extension loaded.
-- A Redis server reachable by TCP.
+- `redis-server` available on PATH, or an external Redis server reachable by
+  TCP when using `--redis-server=none`.
 - Composer dependencies installed with `composer install`.
 - `posix` support in PHP if worker killing is enabled.
 
@@ -53,7 +54,8 @@ bin/harness \
 ```
 
 The harness treats `relay-cache-fuzzer` as an inferior process. It appends a
-unique `--run-id`, `--seed`, and `--keyspace-isolated` to each run, records
+unique `--run-id` and `--seed` to each run, adds `--keyspace-isolated` only
+when using `--redis-server=none`, records
 per-run logs under `artifacts/runs/` while a run is active, removes per-run
 artifacts by default, and copies flaw artifacts into
 `artifacts/failures/000001`, `000002`, and so on. Inferior exit codes are:
@@ -184,8 +186,9 @@ Common options:
 - `--host=127.0.0.1`: server bind host.
 - `--port=0`: server port. `0` chooses a free port. Under `bin/harness --jobs=N`, `--fpm --port=BASE` uses `BASE + job_index` for job indexes `0..N-1`.
 - `--redis-host=127.0.0.1`
-- `--redis-port=6379`
+- `--redis-port=0`: Redis port. `0` chooses a free port for the per-run Redis server. Under `bin/harness --jobs=N`, `--redis-port=BASE` uses `BASE + job_index` for job indexes `0..N-1`.
 - `--redis-db=0`
+- `--redis-server=redis-server|none`: spawn this Redis server binary per run, or use an existing Redis endpoint with `none`.
 - `--workers=N`: CLI-server worker count, or static php-fpm worker count under `--fpm`.
 - `--duration=SECONDS`: randomized-mode wall-clock limit. Default: 60. Ignored when `--commands-per-worker` is set.
 - `--commands-per-worker=N`: randomized-mode command-count limit for small reproducers. The fuzzer stops after roughly `N * --workers` successful worker-handled HTTP commands in the main fuzz phase, checked between iterations.

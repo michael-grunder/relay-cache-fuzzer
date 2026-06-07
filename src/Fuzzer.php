@@ -520,6 +520,8 @@ final class StartupBlock
             ['section' => 'redis', 'setting' => 'host', 'value' => $config->redisHost],
             ['section' => 'redis', 'setting' => 'port', 'value' => $config->redisPort],
             ['section' => 'redis', 'setting' => 'db', 'value' => $config->redisDb],
+            ['section' => 'redis', 'setting' => 'server', 'value' => $config->redisServer],
+            ['section' => 'redis', 'setting' => 'owned', 'value' => $config->redisServer !== null],
             ['section' => 'relay_ini', 'setting' => 'relay.cache', 'value' => 1],
             ['section' => 'relay_ini', 'setting' => 'relay.max_endpoint_dbs', 'value' => $config->relayMaxEndpointDbs],
             ['section' => 'relay_ini', 'setting' => 'relay.max_db_writers', 'value' => $config->relayMaxDbWriters],
@@ -826,6 +828,15 @@ final class RedisClient
         }
     }
 
+    public function flushAll(): void
+    {
+        $reply = $this->command(['FLUSHALL']);
+
+        if ($reply !== 'OK') {
+            throw new FuzzerException('Redis FLUSHALL failed');
+        }
+    }
+
     public function get(string $key): ?string
     {
         $reply = $this->command(['GET', $key]);
@@ -970,6 +981,120 @@ final class RedisClient
         }
 
         return $items;
+    }
+}
+
+final class RedisServerProcess
+{
+    private Process $process;
+    private string $runtimeDir;
+
+    public function __construct(
+        private readonly Config $config,
+        private readonly LoggerInterface $logger,
+        string $runId,
+    ) {
+        $safeRunId = preg_replace('/[^A-Za-z0-9_.:-]/', '-', $runId) ?: bin2hex(random_bytes(6));
+        $this->runtimeDir = sys_get_temp_dir() . DIRECTORY_SEPARATOR . 'relay-cache-fuzzer-redis-' . $safeRunId;
+    }
+
+    public function start(): void
+    {
+        if ($this->config->redisServer === null) {
+            return;
+        }
+
+        if (!is_dir($this->runtimeDir) && !mkdir($this->runtimeDir, 0777, true) && !is_dir($this->runtimeDir)) {
+            throw new FuzzerException("Could not create Redis runtime directory {$this->runtimeDir}");
+        }
+
+        $command = [
+            $this->config->redisServer,
+            '--bind', $this->config->redisHost,
+            '--port', (string) $this->config->redisPort,
+            '--daemonize', 'no',
+            '--save', '',
+            '--appendonly', 'no',
+            '--protected-mode', 'no',
+            '--dir', $this->runtimeDir,
+            '--dbfilename', 'dump.rdb',
+        ];
+
+        $this->process = new Process($command, dirname(__DIR__));
+        $this->process->setTimeout(null);
+        $this->logger->info('starting ephemeral Redis server', [
+            'host' => $this->config->redisHost,
+            'port' => $this->config->redisPort,
+            'runtime_dir' => $this->runtimeDir,
+        ]);
+        $this->logger->debug('Redis command line', ['command' => $this->process->getCommandLine()]);
+        $this->process->start();
+        $this->waitUntilReady();
+    }
+
+    public function stop(): void
+    {
+        if ($this->config->redisServer === null || !isset($this->process)) {
+            return;
+        }
+
+        if ($this->process->isRunning()) {
+            $this->logger->info('stopping ephemeral Redis server', ['pid' => $this->process->getPid()]);
+
+            try {
+                (new RedisClient($this->config->redisHost, $this->config->redisPort, 0, $this->config->requestTimeoutMs))
+                    ->command(['SHUTDOWN', 'NOSAVE']);
+            } catch (Throwable) {
+            }
+
+            $this->process->stop(1.0, 15);
+        }
+
+        if (!$this->config->keepTemp && is_dir($this->runtimeDir)) {
+            self::removeTree($this->runtimeDir);
+        }
+    }
+
+    private function waitUntilReady(): void
+    {
+        $deadline = microtime(true) + max(2.0, $this->config->requestTimeoutMs / 1000 * 5);
+        $lastError = null;
+
+        while (microtime(true) < $deadline) {
+            if (!$this->process->isRunning()) {
+                throw new FuzzerException('Ephemeral Redis server exited before becoming ready');
+            }
+
+            try {
+                (new RedisClient($this->config->redisHost, $this->config->redisPort, 0, $this->config->requestTimeoutMs))->ping();
+                $this->logger->debug('ephemeral Redis ping succeeded');
+                return;
+            } catch (Throwable $e) {
+                $lastError = $e->getMessage();
+                usleep(20_000);
+            }
+        }
+
+        throw new FuzzerException('Ephemeral Redis server did not become ready' . ($lastError === null ? '' : ": {$lastError}"));
+    }
+
+    private static function removeTree(string $path): void
+    {
+        $iterator = new RecursiveIteratorIterator(
+            new RecursiveDirectoryIterator($path, RecursiveDirectoryIterator::SKIP_DOTS),
+            RecursiveIteratorIterator::CHILD_FIRST,
+        );
+
+        foreach ($iterator as $item) {
+            if ($item->isDir()) {
+                rmdir($item->getPathname());
+                continue;
+            }
+
+            unlink($item->getPathname());
+        }
+
+        rmdir($path);
     }
 }
 
@@ -1908,6 +2033,7 @@ final class Fuzzer
     private RedisClient $redis;
     private HttpClient $http;
     private ServerProcess $server;
+    private ?RedisServerProcess $redisServer = null;
     private LoggerInterface $logger;
     private string $runId;
     private ?string $failurePath = null;
@@ -1954,7 +2080,14 @@ final class Fuzzer
 
     public function __construct(Config $config)
     {
-        $this->config = $config->port === 0 ? $config->withPort(self::pickFreePort($config->host)) : $config;
+        if ($config->port === 0) {
+            $config = $config->withPort(self::pickFreePort($config->host));
+        }
+        if ($config->redisServer !== null && $config->redisPort === 0) {
+            $config = $config->withRedisPort(self::pickFreePort($config->redisHost));
+        }
+
+        $this->config = $config;
         $this->logger = LogFactory::create($this->config);
         $this->rng = new Rng($this->config->seed);
         $this->runId = $this->config->runId ?? dechex($this->config->seed) . '-' . bin2hex(random_bytes(3));
@@ -1980,24 +2113,24 @@ final class Fuzzer
             'run_limit' => $this->runLimitDescription(),
         ]);
 
-        $this->logger->debug('connecting to Redis', [
-            'host' => $this->config->redisHost,
-            'port' => $this->config->redisPort,
-            'db' => $this->config->redisDb,
-        ]);
-        $this->redis = new RedisClient(
-            $this->config->redisHost,
-            $this->config->redisPort,
-            $this->config->redisDb,
-            $this->config->requestTimeoutMs,
-        );
-        $this->redis->ping();
-        $this->logger->debug('Redis ping succeeded');
-
-        $this->http = new HttpClient($this->config->host, $this->config->port, $this->config->requestTimeoutMs);
-        $this->server = new ServerProcess($this->config, $this->logger, runId: $this->runId);
-
         try {
+            $this->startOwnedRedis();
+            $this->logger->debug('connecting to Redis', [
+                'host' => $this->config->redisHost,
+                'port' => $this->config->redisPort,
+                'db' => $this->config->redisDb,
+            ]);
+            $this->redis = new RedisClient(
+                $this->config->redisHost,
+                $this->config->redisPort,
+                $this->config->redisDb,
+                $this->config->requestTimeoutMs,
+            );
+            $this->redis->ping();
+            $this->logger->debug('Redis ping succeeded');
+
+            $this->http = new HttpClient($this->config->host, $this->config->port, $this->config->requestTimeoutMs);
+            $this->server = new ServerProcess($this->config, $this->logger, runId: $this->runId);
             $this->server->start();
             $this->waitUntilReady();
 
@@ -2025,7 +2158,7 @@ final class Fuzzer
                 'stale_observations' => $this->stats['stale_observations'],
             ]);
         } catch (Throwable $e) {
-            $path = $this->failurePath ?? $this->maybeWriteReproducer('exception', ['message' => $e->getMessage()]);
+            $path = $this->failurePath ?? (isset($this->server) ? $this->maybeWriteReproducer('exception', ['message' => $e->getMessage()]) : null);
             $type = $this->failureType ?? ReproducerTypes::OTHER;
 
             if ($path !== null) {
@@ -2036,7 +2169,28 @@ final class Fuzzer
             $this->logger->error('fuzz run failed without captured reproducer', ['error' => $e->getMessage(), 'reproducer_type' => $type]);
             throw new FuzzerException($e->getMessage() . "\nreproducer_type={$type}", previous: $e);
         } finally {
-            $this->server->stop();
+            if (isset($this->server)) {
+                $this->server->stop();
+            }
+            $this->stopOwnedRedis();
+        }
+    }
+
+    private function startOwnedRedis(): void
+    {
+        if ($this->config->redisServer === null) {
+            return;
+        }
+
+        $this->redisServer = new RedisServerProcess($this->config, $this->logger, $this->runId);
+        $this->redisServer->start();
+    }
+
+    private function stopOwnedRedis(): void
+    {
+        if ($this->redisServer instanceof RedisServerProcess) {
+            $this->redisServer->stop();
+            $this->redisServer = null;
         }
     }
 
@@ -2718,6 +2872,7 @@ final class SequentialFuzzer
     private RedisClient $redis;
     private HttpClient $http;
     private ServerProcess $server;
+    private ?RedisServerProcess $redisServer = null;
     private LoggerInterface $logger;
     private string $runId;
     private ?string $rrTraceDir;
@@ -2767,7 +2922,14 @@ final class SequentialFuzzer
 
     public function __construct(Config $config)
     {
-        $this->config = $config->port === 0 ? $config->withPort(self::pickFreePort($config->host)) : $config;
+        if ($config->port === 0) {
+            $config = $config->withPort(self::pickFreePort($config->host));
+        }
+        if ($config->redisServer !== null && $config->redisPort === 0) {
+            $config = $config->withRedisPort(self::pickFreePort($config->redisHost));
+        }
+
+        $this->config = $config;
         $this->logger = LogFactory::create($this->config);
         $this->rng = new Rng($this->config->seed);
         $this->runId = $this->config->runId ?? dechex($this->config->seed) . '-seq-' . bin2hex(random_bytes(3));
@@ -2792,18 +2954,18 @@ final class SequentialFuzzer
             'rr_trace_dir' => $this->rrTraceDir,
         ]);
 
-        $this->redis = new RedisClient(
-            $this->config->redisHost,
-            $this->config->redisPort,
-            $this->config->redisDb,
-            $this->config->requestTimeoutMs,
-        );
-        $this->redis->ping();
-
-        $this->http = new HttpClient($this->config->host, $this->config->port, $this->config->requestTimeoutMs);
-        $this->server = new ServerProcess($this->config, $this->logger, $this->rrTraceDir, $this->runId);
-
         try {
+            $this->startOwnedRedis();
+            $this->redis = new RedisClient(
+                $this->config->redisHost,
+                $this->config->redisPort,
+                $this->config->redisDb,
+                $this->config->requestTimeoutMs,
+            );
+            $this->redis->ping();
+
+            $this->http = new HttpClient($this->config->host, $this->config->port, $this->config->requestTimeoutMs);
+            $this->server = new ServerProcess($this->config, $this->logger, $this->rrTraceDir, $this->runId);
             $this->server->start();
             $this->waitUntilReady();
             $this->discoverInitialWorkers();
@@ -2820,11 +2982,11 @@ final class SequentialFuzzer
                 'stale_observations' => $this->stats['stale_observations'],
             ]);
         } catch (Throwable $e) {
-            $serverStopTimedOut = !$this->server->stop();
+            $serverStopTimedOut = isset($this->server) && !$this->server->stop();
             $context = $this->failureContext ?? [];
-            $type = ReproducerTypes::classify($e->getMessage(), $context, $this->stats, $this->server, $serverStopTimedOut);
+            $type = ReproducerTypes::classify($e->getMessage(), $context, $this->stats, $this->server ?? null, $serverStopTimedOut);
 
-            if (!ReproducerTypes::shouldCapture($this->config->captureTypes, $type)) {
+            if (!isset($this->server) || !ReproducerTypes::shouldCapture($this->config->captureTypes, $type)) {
                 $this->logger->error('sequential fuzz run failed without captured reproducer', ['error' => $e->getMessage(), 'reproducer_type' => $type]);
                 throw new FuzzerException($e->getMessage() . "\nreproducer_type={$type}", previous: $e);
             }
@@ -2834,7 +2996,28 @@ final class SequentialFuzzer
 
             throw new FuzzerException($e->getMessage() . "\nreproducer_type={$type}\nreproducer={$path}", previous: $e);
         } finally {
-            $this->server->stop();
+            if (isset($this->server)) {
+                $this->server->stop();
+            }
+            $this->stopOwnedRedis();
+        }
+    }
+
+    private function startOwnedRedis(): void
+    {
+        if ($this->config->redisServer === null) {
+            return;
+        }
+
+        $this->redisServer = new RedisServerProcess($this->config, $this->logger, $this->runId);
+        $this->redisServer->start();
+    }
+
+    private function stopOwnedRedis(): void
+    {
+        if ($this->redisServer instanceof RedisServerProcess) {
+            $this->redisServer->stop();
+            $this->redisServer = null;
         }
     }
 
@@ -3712,6 +3895,7 @@ final class SimpleSequentialFuzzer
     private RedisClient $redis;
     private HttpClient $http;
     private ServerProcess $server;
+    private ?RedisServerProcess $redisServer = null;
     private LoggerInterface $logger;
     private string $runId;
     private ?string $rrTraceDir;
@@ -3760,6 +3944,7 @@ final class SimpleSequentialFuzzer
         'workers_killed' => 0,
         'mutations' => 0,
         'flushdb_mutations' => 0,
+        'flushall_mutations' => 0,
         'verify_scans' => 0,
         'stale_observations' => 0,
         'persistent_stale_failures' => 0,
@@ -3767,7 +3952,14 @@ final class SimpleSequentialFuzzer
 
     public function __construct(Config $config)
     {
-        $this->config = $config->port === 0 ? $config->withPort(self::pickFreePort($config->host)) : $config;
+        if ($config->port === 0) {
+            $config = $config->withPort(self::pickFreePort($config->host));
+        }
+        if ($config->redisServer !== null && $config->redisPort === 0) {
+            $config = $config->withRedisPort(self::pickFreePort($config->redisHost));
+        }
+
+        $this->config = $config;
         $this->logger = LogFactory::create($this->config);
         $this->rng = new Rng($this->config->seed);
         $this->runId = $this->config->runId ?? dechex($this->config->seed) . '-simple-seq-' . bin2hex(random_bytes(3));
@@ -3801,19 +3993,19 @@ final class SimpleSequentialFuzzer
             'mutations' => $this->config->mutations,
         ]);
 
-        $this->redis = new RedisClient(
-            $this->config->redisHost,
-            $this->config->redisPort,
-            $this->config->redisDb,
-            $this->config->requestTimeoutMs,
-        );
-        $this->redis->ping();
-        $this->initializeKeyspace();
-
-        $this->http = new HttpClient($this->config->host, $this->config->port, $this->config->requestTimeoutMs);
-        $this->server = new ServerProcess($this->config, $this->logger, $this->rrTraceDir, $this->runId);
-
         try {
+            $this->startOwnedRedis();
+            $this->redis = new RedisClient(
+                $this->config->redisHost,
+                $this->config->redisPort,
+                $this->config->redisDb,
+                $this->config->requestTimeoutMs,
+            );
+            $this->redis->ping();
+            $this->initializeKeyspace();
+
+            $this->http = new HttpClient($this->config->host, $this->config->port, $this->config->requestTimeoutMs);
+            $this->server = new ServerProcess($this->config, $this->logger, $this->rrTraceDir, $this->runId);
             $this->server->start();
             $this->waitUntilReady();
             $this->discoverInitialWorkers();
@@ -3830,11 +4022,11 @@ final class SimpleSequentialFuzzer
                 'stale_observations' => $this->stats['stale_observations'],
             ]);
         } catch (Throwable $e) {
-            $serverStopTimedOut = !$this->server->stop();
+            $serverStopTimedOut = isset($this->server) && !$this->server->stop();
             $context = $this->failureContext ?? [];
-            $type = ReproducerTypes::classify($e->getMessage(), $context, $this->stats, $this->server, $serverStopTimedOut);
+            $type = ReproducerTypes::classify($e->getMessage(), $context, $this->stats, $this->server ?? null, $serverStopTimedOut);
 
-            if (!ReproducerTypes::shouldCapture($this->config->captureTypes, $type)) {
+            if (!isset($this->server) || !ReproducerTypes::shouldCapture($this->config->captureTypes, $type)) {
                 $this->logger->error('simple sequential fuzz run failed without captured reproducer', ['error' => $e->getMessage(), 'reproducer_type' => $type]);
                 throw new FuzzerException($e->getMessage() . "\nreproducer_type={$type}", previous: $e);
             }
@@ -3844,7 +4036,28 @@ final class SimpleSequentialFuzzer
 
             throw new FuzzerException($e->getMessage() . "\nreproducer_type={$type}\nreproducer={$path}", previous: $e);
         } finally {
-            $this->server->stop();
+            if (isset($this->server)) {
+                $this->server->stop();
+            }
+            $this->stopOwnedRedis();
+        }
+    }
+
+    private function startOwnedRedis(): void
+    {
+        if ($this->config->redisServer === null) {
+            return;
+        }
+
+        $this->redisServer = new RedisServerProcess($this->config, $this->logger, $this->runId);
+        $this->redisServer->start();
+    }
+
+    private function stopOwnedRedis(): void
+    {
+        if ($this->redisServer instanceof RedisServerProcess) {
+            $this->redisServer->stop();
+            $this->redisServer = null;
         }
     }
 
@@ -4075,7 +4288,14 @@ final class SimpleSequentialFuzzer
     private function performRandomMutations(): void
     {
         for ($i = 0; $i < $this->config->mutations; $i++) {
-            if ($this->rng->int(1, 10) === 1) {
+            $choice = $this->rng->int(1, 20);
+
+            if ($choice === 1 && !$this->config->keyspaceIsolated && $this->config->redisServer !== null) {
+                $this->performFlushAllMutation();
+                continue;
+            }
+
+            if ($choice <= 3) {
                 $this->performFlushDbMutation();
                 continue;
             }
@@ -4120,6 +4340,19 @@ final class SimpleSequentialFuzzer
         $this->mutations[] = $event;
         $this->stats['mutations']++;
         $this->stats['flushdb_mutations']++;
+        $this->recordEvent('mutation', $event);
+        $this->logLine('MUTATE', $event);
+        $this->rebuildKeyspaceAfterFlush();
+    }
+
+    private function performFlushAllMutation(): void
+    {
+        $this->redis->flushAll();
+        $event = ['op' => 'FLUSHALL'];
+        $this->lastMutation = $event;
+        $this->mutations[] = $event;
+        $this->stats['mutations']++;
+        $this->stats['flushall_mutations']++;
         $this->recordEvent('mutation', $event);
         $this->logLine('MUTATE', $event);
         $this->rebuildKeyspaceAfterFlush();
@@ -4604,12 +4837,22 @@ final class ReplayRunner
     private RedisClient $redis;
     private HttpClient $http;
     private ServerProcess $server;
+    private ?RedisServerProcess $redisServer = null;
     private LoggerInterface $logger;
+    private string $runId;
 
     public function __construct(Config $config)
     {
-        $this->config = $config->port === 0 ? $config->withPort($this->pickFreePort($config->host)) : $config;
+        if ($config->port === 0) {
+            $config = $config->withPort($this->pickFreePort($config->host));
+        }
+        if ($config->redisServer !== null && $config->redisPort === 0) {
+            $config = $config->withRedisPort($this->pickFreePort($config->redisHost));
+        }
+
+        $this->config = $config;
         $this->logger = LogFactory::create($this->config);
+        $this->runId = $this->config->runId ?? 'replay-' . bin2hex(random_bytes(3));
     }
 
     public function run(): void
@@ -4631,16 +4874,16 @@ final class ReplayRunner
             throw new FuzzerException('Replay file does not contain an events array');
         }
 
-        $this->redis = new RedisClient(
-            $this->config->redisHost,
-            $this->config->redisPort,
-            $this->config->redisDb,
-            $this->config->requestTimeoutMs,
-        );
-        $this->http = new HttpClient($this->config->host, $this->config->port, $this->config->requestTimeoutMs);
-        $this->server = new ServerProcess($this->config, $this->logger, runId: 'replay-' . bin2hex(random_bytes(3)));
-
         try {
+            $this->startOwnedRedis();
+            $this->redis = new RedisClient(
+                $this->config->redisHost,
+                $this->config->redisPort,
+                $this->config->redisDb,
+                $this->config->requestTimeoutMs,
+            );
+            $this->http = new HttpClient($this->config->host, $this->config->port, $this->config->requestTimeoutMs);
+            $this->server = new ServerProcess($this->config, $this->logger, runId: $this->runId);
             $this->server->start();
             $this->waitForPid();
 
@@ -4652,7 +4895,28 @@ final class ReplayRunner
 
             $this->logger->info('replay completed', ['file' => $this->config->replayFile]);
         } finally {
-            $this->server->stop();
+            if (isset($this->server)) {
+                $this->server->stop();
+            }
+            $this->stopOwnedRedis();
+        }
+    }
+
+    private function startOwnedRedis(): void
+    {
+        if ($this->config->redisServer === null) {
+            return;
+        }
+
+        $this->redisServer = new RedisServerProcess($this->config, $this->logger, $this->runId);
+        $this->redisServer->start();
+    }
+
+    private function stopOwnedRedis(): void
+    {
+        if ($this->redisServer instanceof RedisServerProcess) {
+            $this->redisServer->stop();
+            $this->redisServer = null;
         }
     }
 

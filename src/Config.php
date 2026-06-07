@@ -20,6 +20,7 @@ final class Config
         public readonly string $redisHost,
         public readonly int $redisPort,
         public readonly int $redisDb,
+        public readonly ?string $redisServer,
         public readonly int $workers,
         public readonly int $durationSeconds,
         public readonly ?int $commandsPerWorker,
@@ -72,9 +73,14 @@ final class Config
         $fpm = self::bool($raw, 'fpm');
         $harnessJobIndex = isset($raw['harness-job-index']) ? max(0, self::int($raw, 'harness-job-index')) : null;
         $port = self::int($raw, 'port', 0);
+        $redisPort = self::int($raw, 'redis-port', 0);
 
         if ($fpm && $harnessJobIndex !== null && $port > 0) {
             $port += $harnessJobIndex;
+        }
+
+        if ($harnessJobIndex !== null && $redisPort > 0) {
+            $redisPort += $harnessJobIndex;
         }
 
         return new self(
@@ -84,8 +90,9 @@ final class Config
             host: self::string($raw, 'host', '127.0.0.1'),
             port: $port,
             redisHost: self::string($raw, 'redis-host', '127.0.0.1'),
-            redisPort: self::int($raw, 'redis-port', 6379),
+            redisPort: $redisPort,
             redisDb: self::int($raw, 'redis-db', 0),
+            redisServer: self::redisServer($raw),
             workers: max(1, self::int($raw, 'workers', 2)),
             durationSeconds: max(1, self::int($raw, 'duration', 60)),
             commandsPerWorker: isset($raw['commands-per-worker']) ? max(1, self::int($raw, 'commands-per-worker')) : null,
@@ -137,6 +144,59 @@ final class Config
             redisHost: $this->redisHost,
             redisPort: $this->redisPort,
             redisDb: $this->redisDb,
+            redisServer: $this->redisServer,
+            workers: $this->workers,
+            durationSeconds: $this->durationSeconds,
+            commandsPerWorker: $this->commandsPerWorker,
+            seed: $this->seed,
+            relayMaxEndpointDbs: $this->relayMaxEndpointDbs,
+            relayMaxDbWriters: $this->relayMaxDbWriters,
+            captureRelayLogLevel: $this->captureRelayLogLevel,
+            killRate: $this->killRate,
+            maxKill: $this->maxKill,
+            keys: $this->keys,
+            mutations: $this->mutations,
+            keysPerWorker: $this->keysPerWorker,
+            warmupReads: $this->warmupReads,
+            verifyRetries: $this->verifyRetries,
+            verifyDelayUs: $this->verifyDelayUs,
+            delayUs: $this->delayUs,
+            requestTimeoutMs: $this->requestTimeoutMs,
+            watchdogTimeoutMs: $this->watchdogTimeoutMs,
+            verbose: $this->verbose,
+            logLevel: $this->logLevel,
+            logFile: $this->logFile,
+            keepTemp: $this->keepTemp,
+            failFast: $this->failFast,
+            runId: $this->runId,
+            keyspaceIsolated: $this->keyspaceIsolated,
+            signalWeights: $this->signalWeights,
+            signals: $this->signals,
+            captureTypes: $this->captureTypes,
+            replayFile: $this->replayFile,
+            rr: $this->rr,
+            rrTraceDir: $this->rrTraceDir,
+            fpm: $this->fpm,
+            phpFpm: $this->phpFpm,
+            nginx: $this->nginx,
+            fpmConfStub: $this->fpmConfStub,
+            fpmPoolConfStub: $this->fpmPoolConfStub,
+            harnessJobIndex: $this->harnessJobIndex,
+        );
+    }
+
+    public function withRedisPort(int $redisPort): self
+    {
+        return new self(
+            mode: $this->mode,
+            php: $this->php,
+            client: $this->client,
+            host: $this->host,
+            port: $this->port,
+            redisHost: $this->redisHost,
+            redisPort: $redisPort,
+            redisDb: $this->redisDb,
+            redisServer: $this->redisServer,
             workers: $this->workers,
             durationSeconds: $this->durationSeconds,
             commandsPerWorker: $this->commandsPerWorker,
@@ -316,10 +376,16 @@ Redis:
       Redis host used by both the driver and router. Default: 127.0.0.1.
 
   --redis-port=PORT
-      Redis TCP port. Default: 6379.
+      Redis TCP port. Use 0 to pick a free port for the owned Redis server.
+      Under --harness-job-index=N, a nonzero port becomes PORT + N. Default: 0.
 
   --redis-db=N
       Redis database number. Default: 0.
+
+  --redis-server=PATH|none
+      redis-server binary used for the per-run ephemeral Redis instance.
+      Pass none to use an already-running Redis endpoint. Default:
+      redis-server.
 
 Relay INI:
   --relay-max-endpoint-dbs=N
@@ -564,6 +630,20 @@ HELP;
         }
 
         return $client;
+    }
+
+    /**
+     * @param array<string, string|bool> $raw
+     */
+    private static function redisServer(array $raw): ?string
+    {
+        $server = self::string($raw, 'redis-server', 'redis-server');
+
+        if ($server === '' || strtolower($server) === 'none') {
+            return null;
+        }
+
+        return $server;
     }
 
     private static function runId(string $runId): string
